@@ -46,6 +46,13 @@ export function TradeModal({ isOpen, onClose, opportunity }: Props) {
   const shares = amountNum / price
   const potentialProfit = shares - amountNum
 
+  // Calculate end_date from time_to_close_hours
+  const getEndDate = (): string | undefined => {
+    if (!opportunity.time_to_close_hours) return undefined
+    const endMs = Date.now() + opportunity.time_to_close_hours * 60 * 60 * 1000
+    return new Date(endMs).toISOString()
+  }
+
   const handleSwitchNetwork = async () => {
     try {
       await switchChain({ chainId: 137 })
@@ -131,6 +138,7 @@ export function TradeModal({ isOpen, onClose, opportunity }: Props) {
           entry_price: opportunity.entry_price,
           token_id: opportunity.token_id!,
           signed_order: signedOrder,
+          end_date: getEndDate(),
         })
       } else {
         // Generated wallet live trade - backend handles signing

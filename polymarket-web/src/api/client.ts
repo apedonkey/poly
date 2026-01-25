@@ -168,6 +168,7 @@ export interface SignedOrderRequest {
     signatureType: number
     signature: string
   }
+  end_date?: string // ISO8601 timestamp when market ends
 }
 
 export async function executeSignedTrade(
@@ -299,7 +300,7 @@ export async function submitOrderToClob(
 // Record a position after browser-side CLOB submission
 export async function recordPosition(
   sessionToken: string,
-  request: Omit<SignedOrderRequest, 'signed_order'> & { order_id?: string }
+  request: Omit<SignedOrderRequest, 'signed_order'> & { order_id?: string; end_date?: string }
 ): Promise<{ success: boolean; position_id?: number; message?: string }> {
   return fetchJson(`${API_BASE}/trades/record`, {
     method: 'POST',

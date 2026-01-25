@@ -1,4 +1,4 @@
-import { Clock, TrendingUp, TrendingDown, FileText } from 'lucide-react'
+import { Clock, TrendingUp, TrendingDown, FileText, Timer } from 'lucide-react'
 import type { Position } from '../../types'
 
 interface Props {
@@ -20,6 +20,24 @@ export function PositionCard({ position }: Props) {
       minute: '2-digit',
     })
   }
+
+  // Calculate time remaining until market ends
+  const getTimeRemaining = () => {
+    if (!position.end_date) return null
+    const endDate = new Date(position.end_date)
+    const now = new Date()
+    const diffMs = endDate.getTime() - now.getTime()
+
+    if (diffMs <= 0) return 'Ended'
+
+    const hours = diffMs / (1000 * 60 * 60)
+    if (hours < 1) return `${Math.round(hours * 60)}m`
+    if (hours < 24) return `${hours.toFixed(1)}h`
+    if (hours < 24 * 7) return `${(hours / 24).toFixed(1)}d`
+    return `${(hours / (24 * 7)).toFixed(1)}w`
+  }
+
+  const timeRemaining = getTimeRemaining()
 
   const statusColors = {
     Open: 'bg-blue-500/20 text-blue-400',
@@ -87,9 +105,21 @@ export function PositionCard({ position }: Props) {
         </div>
       </div>
 
-      <div className="flex items-center gap-1 text-xs text-gray-500 mt-3">
-        <Clock className="w-3.5 h-3.5" />
-        <span>Opened {formatDate(position.opened_at)}</span>
+      <div className="flex items-center justify-between text-xs text-gray-500 mt-3">
+        <div className="flex items-center gap-1">
+          <Clock className="w-3.5 h-3.5" />
+          <span>Opened {formatDate(position.opened_at)}</span>
+        </div>
+        {timeRemaining && position.status === 'Open' && (
+          <div className={`flex items-center gap-1 ${
+            timeRemaining === 'Ended' ? 'text-poly-red' :
+            timeRemaining.includes('h') && parseFloat(timeRemaining) < 4 ? 'text-yellow-400' :
+            'text-gray-400'
+          }`}>
+            <Timer className="w-3.5 h-3.5" />
+            <span>{timeRemaining === 'Ended' ? 'Market Ended' : `Ends in ${timeRemaining}`}</span>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -191,6 +191,31 @@ pub struct Position {
     pub pnl: Option<Decimal>,
     pub status: PositionStatus,
     pub is_paper: bool,
+    /// When the market ends/closes
+    pub end_date: Option<DateTime<Utc>>,
+}
+
+impl Position {
+    /// Get hours remaining until market closes
+    pub fn hours_until_close(&self) -> Option<f64> {
+        self.end_date.map(|end| {
+            let now = Utc::now();
+            let duration = end.signed_duration_since(now);
+            duration.num_minutes() as f64 / 60.0
+        })
+    }
+
+    /// Format time remaining for display
+    pub fn time_remaining_display(&self) -> String {
+        match self.hours_until_close() {
+            Some(h) if h <= 0.0 => "Ended".to_string(),
+            Some(h) if h < 1.0 => format!("{:.0}m", h * 60.0),
+            Some(h) if h < 24.0 => format!("{:.1}h", h),
+            Some(h) if h < 24.0 * 7.0 => format!("{:.1}d", h / 24.0),
+            Some(h) => format!("{:.1}w", h / (24.0 * 7.0)),
+            None => "Unknown".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

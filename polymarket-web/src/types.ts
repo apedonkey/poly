@@ -50,6 +50,7 @@ export interface Position {
   pnl: string | null
   status: 'Open' | 'PendingResolution' | 'Resolved' | 'Closed'
   is_paper: boolean
+  end_date: string | null
 }
 
 // Stats

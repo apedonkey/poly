@@ -12,6 +12,7 @@ use axum_extra::{
     headers::{authorization::Bearer, Authorization},
     TypedHeader,
 };
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -154,6 +155,11 @@ pub async fn execute_trade(
         }
     };
 
+    // Calculate end_date from opportunity's time_to_close_hours
+    let end_date = opportunity
+        .and_then(|o| o.time_to_close_hours)
+        .map(|hours| Utc::now() + Duration::seconds((hours * 3600.0) as i64));
+
     // TODO: Actually execute the trade using Executor with the decrypted private key
     // For now, just record as paper trade
     let position_id = state
@@ -167,6 +173,7 @@ pub async fn execute_trade(
             size,
             StrategyType::ResolutionSniper, // TODO: Get from opportunity
             false, // Live trade
+            end_date,
         )
         .await
         .map_err(|e| {
@@ -243,8 +250,8 @@ pub async fn paper_trade(
         .iter()
         .find(|o| o.market_id == req.market_id && o.side == side);
 
-    let (entry_price, question, strategy) = match opportunity {
-        Some(opp) => (opp.entry_price, opp.question.clone(), opp.strategy),
+    let (entry_price, question, strategy, time_to_close) = match opportunity {
+        Some(opp) => (opp.entry_price, opp.question.clone(), opp.strategy, opp.time_to_close_hours),
         None => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -254,6 +261,10 @@ pub async fn paper_trade(
             ));
         }
     };
+
+    // Calculate end_date from time_to_close_hours
+    let end_date = time_to_close
+        .map(|hours| Utc::now() + Duration::seconds((hours * 3600.0) as i64));
 
     // Record the paper trade
     let position_id = state
@@ -267,6 +278,7 @@ pub async fn paper_trade(
             size,
             strategy,
             true, // Paper trade
+            end_date,
         )
         .await
         .map_err(|e| {
@@ -318,6 +330,8 @@ pub struct SignedTradeRequest {
     pub entry_price: String,
     pub token_id: String,
     pub signed_order: SignedOrder,
+    /// ISO8601 timestamp when market ends
+    pub end_date: Option<String>,
 }
 
 /// Response for signed trade
@@ -439,6 +453,12 @@ pub async fn execute_signed_trade(
         }
     };
 
+    // Parse end_date from request
+    let end_date: Option<DateTime<Utc>> = req.end_date
+        .as_ref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+
     // Record the position regardless of CLOB result
     let position_id = state
         .db
@@ -451,6 +471,7 @@ pub async fn execute_signed_trade(
             size,
             StrategyType::ResolutionSniper, // Default to sniper for now
             false, // Live trade
+            end_date,
         )
         .await
         .map_err(|e| {
@@ -480,6 +501,8 @@ pub struct RecordPositionRequest {
     pub entry_price: String,
     pub token_id: String,
     pub order_id: Option<String>,
+    /// ISO8601 timestamp when market ends
+    pub end_date: Option<String>,
 }
 
 /// Record a position after browser submitted to CLOB
@@ -548,6 +571,12 @@ pub async fn record_position(
         session.wallet_address, req.market_id, side, size, req.order_id
     );
 
+    // Parse end_date from request
+    let end_date: Option<DateTime<Utc>> = req.end_date
+        .as_ref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+
     // Record the position
     let position_id = state
         .db
@@ -560,6 +589,7 @@ pub async fn record_position(
             size,
             StrategyType::ResolutionSniper,
             false, // Live trade
+            end_date,
         )
         .await
         .map_err(|e| {

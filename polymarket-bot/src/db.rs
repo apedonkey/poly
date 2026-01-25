@@ -83,6 +83,15 @@ impl Database {
                 .await?;
         }
 
+        // Check if end_date column exists
+        let has_end_date = table_info.iter().any(|(_, name, _, _, _, _)| name == "end_date");
+        if !table_info.is_empty() && !has_end_date {
+            info!("Migrating positions table: adding end_date column");
+            sqlx::query("ALTER TABLE positions ADD COLUMN end_date TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -140,7 +149,8 @@ impl Database {
                 pnl TEXT,
                 status TEXT NOT NULL DEFAULT 'Open',
                 wallet_address TEXT,
-                is_paper INTEGER NOT NULL DEFAULT 1
+                is_paper INTEGER NOT NULL DEFAULT 1,
+                end_date TEXT
             )
             "#,
         )
@@ -516,6 +526,7 @@ impl Database {
         let pnl: Option<String> = row.get("pnl");
         let closed_at: Option<String> = row.get("closed_at");
         let is_paper: bool = row.try_get("is_paper").unwrap_or(true);
+        let end_date: Option<String> = row.try_get("end_date").unwrap_or(None);
 
         Ok(Position {
             id: row.get("id"),
@@ -533,6 +544,9 @@ impl Database {
             pnl: pnl.and_then(|s| Decimal::from_str(&s).ok()),
             status,
             is_paper,
+            end_date: end_date
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc)),
         })
     }
 
@@ -726,15 +740,17 @@ impl Database {
         size: Decimal,
         strategy: StrategyType,
         is_paper: bool,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let side_str = format!("{:?}", side);
         let strategy_str = format!("{:?}", strategy);
+        let end_date_str = end_date.map(|d| d.to_rfc3339());
 
         let result = sqlx::query(
             r#"
-            INSERT INTO positions (wallet_address, market_id, question, side, entry_price, size, strategy, opened_at, status, is_paper)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?)
+            INSERT INTO positions (wallet_address, market_id, question, side, entry_price, size, strategy, opened_at, status, is_paper, end_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?)
             "#,
         )
         .bind(wallet_address)
@@ -746,6 +762,7 @@ impl Database {
         .bind(strategy_str)
         .bind(now)
         .bind(is_paper)
+        .bind(end_date_str)
         .execute(&self.pool)
         .await?;
 
