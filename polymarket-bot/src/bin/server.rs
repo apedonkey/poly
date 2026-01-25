@@ -35,20 +35,13 @@ async fn main() -> Result<()> {
     info!("Initializing application state...");
     let state = AppState::new(config.clone()).await?;
 
-    // Clone state for background tasks
+    // Clone state for background scanner
     let scanner_state = state.clone();
-    let resolution_db = state.db.clone();
 
-    // Spawn background scanner task
+    // Spawn background scanner task (also handles resolution tracking)
     tokio::spawn(async move {
-        info!("Starting background scanner...");
+        info!("Starting background scanner with resolution tracking...");
         run_scanner(scanner_state).await;
-    });
-
-    // Spawn resolution tracker task (checks every 5 minutes)
-    tokio::spawn(async move {
-        let tracker = ResolutionTracker::new(resolution_db);
-        tracker.run(Duration::from_secs(300)).await;
     });
 
     // Create the Axum app
@@ -71,11 +64,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Background scanner that periodically fetches opportunities
+/// Background scanner that periodically fetches opportunities and checks resolutions
 async fn run_scanner(state: AppState) {
     let scan_interval = state.config.scan_interval_seconds;
+    let resolution_tracker = ResolutionTracker::new(state.db.clone());
 
     loop {
+        // Check for resolved positions (real-time with each scan)
+        if let Err(e) = resolution_tracker.check_resolutions().await {
+            tracing::warn!("Resolution check failed: {}", e);
+        }
+
+        // Scan for new opportunities
         match state.scanner.fetch_markets().await {
             Ok(markets) => {
                 let all_opps = state.runner.find_all_opportunities(&markets);

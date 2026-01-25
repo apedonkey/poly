@@ -63,7 +63,7 @@ impl ResolutionTracker {
     }
 
     /// Check all open positions for resolutions
-    async fn check_resolutions(&self) -> Result<()> {
+    pub async fn check_resolutions(&self) -> Result<()> {
         let open_positions = self.db.get_open_positions().await?;
 
         if open_positions.is_empty() {
