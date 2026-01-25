@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use polymarket_bot::api::{create_app, AppState};
-use polymarket_bot::Config;
+use polymarket_bot::{Config, ResolutionTracker};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -35,13 +35,20 @@ async fn main() -> Result<()> {
     info!("Initializing application state...");
     let state = AppState::new(config.clone()).await?;
 
-    // Clone state for background scanner
+    // Clone state for background tasks
     let scanner_state = state.clone();
+    let resolution_db = state.db.clone();
 
     // Spawn background scanner task
     tokio::spawn(async move {
         info!("Starting background scanner...");
         run_scanner(scanner_state).await;
+    });
+
+    // Spawn resolution tracker task (checks every 5 minutes)
+    tokio::spawn(async move {
+        let tracker = ResolutionTracker::new(resolution_db);
+        tracker.run(Duration::from_secs(300)).await;
     });
 
     // Create the Axum app
