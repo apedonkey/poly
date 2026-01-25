@@ -4,6 +4,7 @@
 use crate::types::{Position, Side};
 use crate::Database;
 use anyhow::Result;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -24,6 +25,10 @@ struct GammaMarket {
     /// Outcome prices as JSON string like "[\"0.95\", \"0.05\"]"
     #[serde(rename = "outcomePrices")]
     outcome_prices: Option<String>,
+    /// Market end date (full ISO timestamp)
+    end_date: Option<String>,
+    /// Market end date (ISO date only, e.g. "2024-01-15")
+    end_date_iso: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +105,17 @@ impl ResolutionTracker {
     async fn check_position_resolution(&self, position: &Position) -> Result<Option<(bool, Decimal)>> {
         // Fetch market data from Gamma API
         let market = self.fetch_market(&position.market_id).await?;
+
+        // If position doesn't have end_date, update it from market data
+        if position.end_date.is_none() {
+            if let Some(end_date) = self.parse_market_end_date(&market) {
+                if let Err(e) = self.db.update_position_end_date(position.id, end_date).await {
+                    warn!("Failed to update end_date for position {}: {}", position.id, e);
+                } else {
+                    debug!("Updated end_date for position {} to {}", position.id, end_date);
+                }
+            }
+        }
 
         // Check if market is resolved
         let is_resolved = market.resolved.unwrap_or(false);
@@ -206,6 +222,30 @@ impl ResolutionTracker {
         }
 
         Err(anyhow::anyhow!("Could not determine winner from prices: {}", prices_str))
+    }
+
+    /// Parse market end date from Gamma API response
+    fn parse_market_end_date(&self, market: &GammaMarket) -> Option<DateTime<Utc>> {
+        // Try full ISO timestamp first (end_date)
+        if let Some(end_date_str) = &market.end_date {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(end_date_str) {
+                return Some(dt.with_timezone(&Utc));
+            }
+            // Try without timezone
+            if let Ok(dt) = NaiveDateTime::parse_from_str(end_date_str, "%Y-%m-%dT%H:%M:%S") {
+                return Some(dt.and_utc());
+            }
+        }
+
+        // Try date-only format (end_date_iso) with midnight UTC
+        if let Some(date_str) = &market.end_date_iso {
+            if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                let datetime = NaiveDateTime::new(date, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
+                return Some(datetime.and_utc());
+            }
+        }
+
+        None
     }
 }
 

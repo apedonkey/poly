@@ -354,6 +354,16 @@ impl Database {
         Ok(())
     }
 
+    /// Update position end_date (for backfilling existing positions)
+    pub async fn update_position_end_date(&self, id: i64, end_date: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE positions SET end_date = ? WHERE id = ?")
+            .bind(end_date.to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Get all open positions
     pub async fn get_open_positions(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
