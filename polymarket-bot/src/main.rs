@@ -4,7 +4,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use polymarket_bot::{Config, Database, Executor, Scanner, StrategyRunner};
+use polymarket_bot::{Config, Database, DiscordWebhook, Executor, Scanner, StrategyRunner};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -249,12 +250,21 @@ async fn run_bot(config: &Config, interval: u64, auto_execute: Option<f64>) -> R
     println!("  CONTINUOUS MODE");
     println!("  Interval: {}s | Auto-execute: {:?}", interval, auto_execute);
     println!("  Paper Trading: {}", if config.paper_trading { "YES" } else { "NO - LIVE MODE" });
+    if config.discord_webhook_url.is_some() {
+        println!("  Discord Webhook: ENABLED (sniper alerts)");
+    }
     println!("{}\n", "=".repeat(70));
 
     let scanner = Scanner::new(config.clone());
     let runner = StrategyRunner::new(config);
     let db = Database::new(&config.database_path).await?;
     let executor = Executor::new(config.clone(), db);
+
+    // Set up Discord webhook if configured
+    let discord = config.discord_webhook_url.as_ref().map(|url| DiscordWebhook::new(url.clone()));
+
+    // Track which opportunities we've already sent to avoid duplicates
+    let mut sent_alerts: HashSet<String> = HashSet::new();
 
     println!("Starting continuous scan loop (Ctrl+C to stop)...\n");
 
@@ -268,6 +278,14 @@ async fn run_bot(config: &Config, interval: u64, auto_execute: Option<f64>) -> R
 
                     for opp in opportunities.sniper.iter().take(3) {
                         println!("  [SNIPER] {}", opp.recommendation);
+
+                        // Send Discord alert for new sniper opportunities
+                        if let Some(ref webhook) = discord {
+                            if !sent_alerts.contains(&opp.market_id) {
+                                webhook.send_sniper_alert(opp).await;
+                                sent_alerts.insert(opp.market_id.clone());
+                            }
+                        }
 
                         if let Some(threshold) = auto_execute {
                             if opp.edge >= threshold / 100.0 {
@@ -293,6 +311,11 @@ async fn run_bot(config: &Config, interval: u64, auto_execute: Option<f64>) -> R
             Err(e) => {
                 error!("Scan failed: {}", e);
             }
+        }
+
+        // Clean up old alerts periodically (keep last 1000)
+        if sent_alerts.len() > 1000 {
+            sent_alerts.clear();
         }
 
         tokio::time::sleep(Duration::from_secs(interval)).await;

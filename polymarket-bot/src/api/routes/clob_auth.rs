@@ -153,10 +153,9 @@ pub async fn derive_api_key(
             )
         })?;
 
-    // Call Polymarket derive-api-key endpoint with L1 auth headers
-    // The signature from the frontend is the EIP-712 signature
+    // Try to create API key first, fall back to derive if it already exists
     let response = client
-        .get(format!("{}/auth/derive-api-key", CLOB_API))
+        .post(format!("{}/auth/api-key", CLOB_API))
         .header("POLY_ADDRESS", &req.address)
         .header("POLY_SIGNATURE", &req.signature)
         .header("POLY_TIMESTAMP", &req.timestamp)
@@ -164,14 +163,38 @@ pub async fn derive_api_key(
         .send()
         .await
         .map_err(|e| {
-            warn!("Failed to call derive-api-key: {}", e);
+            warn!("Failed to call create-api-key: {}", e);
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
-                    error: format!("Failed to derive API key: {}", e),
+                    error: format!("Failed to create API key: {}", e),
                 }),
             )
         })?;
+
+    // If create fails, try derive (for existing keys)
+    let response = if !response.status().is_success() {
+        info!("Create API key failed, trying derive...");
+        client
+            .get(format!("{}/auth/derive-api-key", CLOB_API))
+            .header("POLY_ADDRESS", &req.address)
+            .header("POLY_SIGNATURE", &req.signature)
+            .header("POLY_TIMESTAMP", &req.timestamp)
+            .header("POLY_NONCE", req.nonce.to_string())
+            .send()
+            .await
+            .map_err(|e| {
+                warn!("Failed to call derive-api-key: {}", e);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse {
+                        error: format!("Failed to derive API key: {}", e),
+                    }),
+                )
+            })?
+    } else {
+        response
+    };
 
     if !response.status().is_success() {
         let status = response.status();

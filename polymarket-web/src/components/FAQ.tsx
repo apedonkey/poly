@@ -16,12 +16,12 @@ const faqs: FAQItem[] = [
     answer: 'NO Bias exploits a structural bias in prediction markets: 78.4% of markets resolve to NO. People create markets hoping YES happens, which inflates YES prices. This strategy buys NO when it\'s undervalued relative to the historical resolution rate. If NO is priced at 35¢ but historically wins 78% of the time, that\'s a 43% edge.'
   },
   {
-    question: 'How does paper trading work?',
-    answer: 'Paper trading lets you simulate trades without using real money. Your positions are tracked in the database, and you can see how your strategy would have performed. This is perfect for testing strategies before committing real funds. Toggle "Paper Trade" in the trade modal to use this feature.'
+    question: 'How do I connect a wallet?',
+    answer: 'Click "Connect Wallet" in the top right and connect with MetaMask, Coinbase Wallet, or WalletConnect. Your trading wallet needs USDC.e (bridged USDC) on Polygon for trading. Polymarket is gasless - you don\'t need POL in your trading wallet! You only need a small amount of POL in your main wallet to transfer USDC.e into your Polymarket trading wallet.'
   },
   {
-    question: 'How do I connect a wallet?',
-    answer: 'Click "Connect Wallet" in the top right. You can either generate a new wallet (save your private key securely - it\'s shown only once!), import an existing wallet with your private key, or connect MetaMask. Your wallet needs USDC on Polygon for trading and POL/MATIC for gas fees.'
+    question: 'How often do opportunities update?',
+    answer: 'The scanner checks for new opportunities every 60 seconds. The opportunities list will automatically refresh with the latest markets matching the Sniper and NO Bias strategies. Prices and market data are fetched in real-time from Polymarket.'
   },
   {
     question: 'What does Edge mean?',
@@ -38,6 +38,10 @@ const faqs: FAQItem[] = [
   {
     question: 'What do the filters (Sniper, NO Bias, Crypto, Sports) do?',
     answer: 'Filters let you focus on specific opportunity types. Sniper shows high-probability favorites closing soon (≤12h). NO Bias shows undervalued NO positions. Crypto and Sports filter markets by category. Use the sort dropdown (funnel icon) to order by time, edge, return, or liquidity.'
+  },
+  {
+    question: 'Why does the "Close" time sometimes seem wrong?',
+    answer: 'The close time shown is based on the market\'s end_date from the API, which can be misleading. Markets don\'t always resolve when the end_date says - they resolve based on the rules in the market description. For example, a market might show "40m" left but actually resolves when an event happens tomorrow. Always click "Resolution Rules" on the opportunity card to see the actual resolution criteria before trading.'
   },
   {
     question: 'Is this financial advice?',
@@ -60,13 +64,13 @@ export function FAQ() {
   }
 
   return (
-    <div className="mb-6">
+    <div className="mb-4 sm:mb-6">
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center gap-2 text-gray-400 hover:text-white transition mb-4"
+        className="flex items-center gap-2 text-gray-400 hover:text-white active:text-white transition mb-3 sm:mb-4 touch-target py-1"
       >
-        <HelpCircle className="w-5 h-5" />
-        <span className="font-medium">Frequently Asked Questions</span>
+        <HelpCircle className="w-4 h-4 sm:w-5 sm:h-5" />
+        <span className="font-medium text-sm sm:text-base">FAQ</span>
         <ChevronDown className={`w-4 h-4 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
@@ -76,17 +80,17 @@ export function FAQ() {
             <div key={index} className={index > 0 ? 'border-t border-poly-border' : ''}>
               <button
                 onClick={() => toggleItem(index)}
-                className="w-full flex items-center justify-between p-4 text-left hover:bg-poly-dark/50 transition"
+                className="w-full flex items-center justify-between p-3 sm:p-4 text-left hover:bg-poly-dark/50 active:bg-poly-dark/50 transition touch-target"
               >
-                <span className="font-medium text-sm">{faq.question}</span>
+                <span className="font-medium text-sm pr-2">{faq.question}</span>
                 <ChevronDown
-                  className={`w-4 h-4 text-gray-400 flex-shrink-0 ml-2 transition-transform ${
+                  className={`w-4 h-4 text-gray-400 flex-shrink-0 transition-transform ${
                     openItems.has(index) ? 'rotate-180' : ''
                   }`}
                 />
               </button>
               {openItems.has(index) && (
-                <div className="px-4 pb-4 text-sm text-gray-400 leading-relaxed">
+                <div className="px-3 sm:px-4 pb-3 sm:pb-4 text-sm text-gray-400 leading-relaxed max-w-prose">
                   {faq.answer}
                 </div>
               )}

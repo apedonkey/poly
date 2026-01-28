@@ -1,12 +1,29 @@
-import { useQuery } from '@tanstack/react-query'
+import { useState, useCallback } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getPositions, getStats } from '../../api/client'
 import { useWalletStore } from '../../stores/walletStore'
 import { PositionCard } from './PositionCard'
 import { StatsCard } from './StatsCard'
+import { SellModal } from './SellModal'
 import { Wallet } from 'lucide-react'
+import type { Position } from '../../types'
 
 export function PositionList() {
   const { sessionToken, isConnected } = useWalletStore()
+  const queryClient = useQueryClient()
+  const [selectedPosition, setSelectedPosition] = useState<Position | null>(null)
+
+  // Memoized callbacks to prevent unnecessary re-renders of PositionCard
+  const handleSell = useCallback((pos: Position) => setSelectedPosition(pos), [])
+
+  const handleTokenIdUpdated = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['positions'] })
+  }, [queryClient])
+
+  const handleRedeemed = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['positions'] })
+    queryClient.invalidateQueries({ queryKey: ['stats'] })
+  }, [queryClient])
 
   const { data: positions, isLoading: positionsLoading } = useQuery({
     queryKey: ['positions', sessionToken],
@@ -54,11 +71,31 @@ export function PositionList() {
         ) : (
           <div className="grid gap-4 md:grid-cols-2">
             {positions.map((position) => (
-              <PositionCard key={position.id} position={position} />
+              <PositionCard
+                key={position.id}
+                position={position}
+                onSell={handleSell}
+                onTokenIdUpdated={handleTokenIdUpdated}
+                onRedeemed={handleRedeemed}
+              />
             ))}
           </div>
         )}
       </div>
+
+      {/* Sell Modal */}
+      {selectedPosition && (
+        <SellModal
+          isOpen={!!selectedPosition}
+          onClose={() => setSelectedPosition(null)}
+          position={selectedPosition}
+          onSold={() => {
+            // Refetch positions after selling
+            queryClient.invalidateQueries({ queryKey: ['positions'] })
+            queryClient.invalidateQueries({ queryKey: ['stats'] })
+          }}
+        />
+      )}
     </div>
   )
 }

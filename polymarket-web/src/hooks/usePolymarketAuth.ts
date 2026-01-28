@@ -131,9 +131,17 @@ export function usePolymarketAuth() {
 
   const hasCredentials = cachedCredentials !== null && credentialsWallet === address
 
+  const getCredentials = useCallback(() => {
+    if (cachedCredentials && credentialsWallet === address) {
+      return cachedCredentials
+    }
+    return null
+  }, [address])
+
   return {
     authenticate,
     clearCredentials,
+    getCredentials,
     isAuthenticating,
     error,
     clearError: () => setError(null),

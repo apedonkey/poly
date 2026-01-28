@@ -17,8 +17,8 @@ use axum_extra::{
 };
 use serde::{Deserialize, Serialize};
 
-// USDC contract address on Polygon
-const USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
+// USDC.e (bridged) contract address on Polygon - used by Polymarket
+const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 /// Generate wallet request
 #[derive(Debug, Deserialize)]

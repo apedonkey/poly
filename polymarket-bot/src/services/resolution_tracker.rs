@@ -13,8 +13,8 @@ use tracing::{debug, error, info, warn};
 
 /// Market data from Polymarket Gamma API
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GammaMarket {
-    #[serde(rename = "conditionId")]
     condition_id: Option<String>,
     #[serde(rename = "questionID")]
     question_id: Option<String>,
@@ -23,12 +23,13 @@ struct GammaMarket {
     /// "Yes" or "No" - the winning outcome
     resolution: Option<String>,
     /// Outcome prices as JSON string like "[\"0.95\", \"0.05\"]"
-    #[serde(rename = "outcomePrices")]
     outcome_prices: Option<String>,
     /// Market end date (full ISO timestamp)
     end_date: Option<String>,
     /// Market end date (ISO date only, e.g. "2024-01-15")
     end_date_iso: Option<String>,
+    /// UMA resolution status - "resolved" when market is resolved
+    uma_resolution_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +97,9 @@ impl ResolutionTracker {
                     warn!("Failed to check position {}: {}", position.id, e);
                 }
             }
+
+            // Rate limit: wait 500ms between API calls to avoid being rate limited
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         Ok(())
@@ -104,7 +108,12 @@ impl ResolutionTracker {
     /// Check if a specific position's market has resolved
     async fn check_position_resolution(&self, position: &Position) -> Result<Option<(bool, Decimal)>> {
         // Fetch market data from Gamma API
-        let market = self.fetch_market(&position.market_id).await?;
+        // Prefer slug if available (more reliable), fall back to market_id
+        let market = if let Some(slug) = &position.slug {
+            self.fetch_market_by_slug(slug).await?
+        } else {
+            self.fetch_market(&position.market_id).await?
+        };
 
         // If position doesn't have end_date, update it from market data
         if position.end_date.is_none() {
@@ -118,7 +127,9 @@ impl ResolutionTracker {
         }
 
         // Check if market is resolved
-        let is_resolved = market.resolved.unwrap_or(false);
+        // Some markets use `resolved: true`, others use `umaResolutionStatus: "resolved"`
+        let is_resolved = market.resolved.unwrap_or(false)
+            || market.uma_resolution_status.as_deref() == Some("resolved");
         if !is_resolved {
             return Ok(None);
         }
@@ -138,54 +149,83 @@ impl ResolutionTracker {
         };
 
         // Determine if we won
-        let we_won = match (&position.side, resolution.to_lowercase().as_str()) {
-            (Side::Yes, "yes") | (Side::Yes, "1") => true,
-            (Side::No, "no") | (Side::No, "0") => true,
-            _ => false,
+        // Resolution can be: "Yes", "No", "yes", "no", "1", "0", "1.0", "0.0", etc.
+        let resolution_lower = resolution.to_lowercase();
+        let resolution_trimmed = resolution_lower.trim();
+
+        let yes_won = resolution_trimmed == "yes"
+            || resolution_trimmed == "1"
+            || resolution_trimmed == "1.0"
+            || resolution_trimmed.starts_with("yes");
+
+        let no_won = resolution_trimmed == "no"
+            || resolution_trimmed == "0"
+            || resolution_trimmed == "0.0"
+            || resolution_trimmed.starts_with("no");
+
+        let we_won = match &position.side {
+            Side::Yes => yes_won,
+            Side::No => no_won,
         };
 
-        // Calculate PnL
-        // If we won: we get $1 per share, so profit = (1 - entry_price) * size
-        // If we lost: we lose our stake, so loss = entry_price * size
+        debug!(
+            "Position {} resolution check: side={:?}, resolution='{}', yes_won={}, no_won={}, we_won={}",
+            position.id, position.side, resolution, yes_won, no_won, we_won
+        );
+
+        // Calculate PnL correctly:
+        // When you buy shares at price P with SIZE dollars:
+        // - Number of shares = SIZE / P
+        //
+        // If you WIN (shares worth $1 each):
+        // - Payout = shares * $1 = SIZE / P
+        // - Profit = payout - cost = (SIZE / P) - SIZE = SIZE * (1 - P) / P
+        //
+        // If you LOSE (shares worth $0):
+        // - Payout = $0
+        // - Loss = -SIZE (you lose your entire stake)
+        let shares = position.size / position.entry_price;
         let pnl = if we_won {
             // Winning: each share pays out $1
-            // Profit = (payout - cost) = (1.0 - entry_price) * size
-            (Decimal::ONE - position.entry_price) * position.size
+            // Profit = (shares * $1) - cost = shares - size
+            shares - position.size
         } else {
-            // Losing: shares worth $0
-            // Loss = -entry_price * size
-            -position.entry_price * position.size
+            // Losing: shares worth $0, we lose our entire stake
+            -position.size
         };
 
         // Determine exit price (1.0 if won, 0.0 if lost)
         let exit_price = if we_won { Decimal::ONE } else { Decimal::ZERO };
 
-        // Update position in database
-        self.db.close_position(position.id, exit_price, pnl).await?;
+        // Update position in database (PnL is calculated inside close_position)
+        self.db.close_position(position.id, exit_price, None).await?;
 
         Ok(Some((we_won, pnl)))
     }
 
     /// Fetch market data from Polymarket Gamma API
     async fn fetch_market(&self, market_id: &str) -> Result<GammaMarket> {
-        // Try fetching by condition ID first
+        // Try fetching by numeric ID first (market_id is the numeric ID like "1273344")
         let url = format!(
-            "https://gamma-api.polymarket.com/markets?condition_id={}",
+            "https://gamma-api.polymarket.com/markets?id={}",
             market_id
         );
 
         let response = self.client.get(&url).send().await?;
 
         if !response.status().is_success() {
-            // Try by slug if condition ID fails
+            // Try by slug if ID fails
             return self.fetch_market_by_slug(market_id).await;
         }
 
         let markets: Vec<GammaMarket> = response.json().await?;
 
-        markets.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("Market not found: {}", market_id)
-        })
+        if let Some(market) = markets.into_iter().next() {
+            return Ok(market);
+        }
+
+        // Fall back to slug query if no results
+        self.fetch_market_by_slug(market_id).await
     }
 
     /// Fetch market by slug as fallback
@@ -204,19 +244,27 @@ impl ResolutionTracker {
     }
 
     /// Determine winner from outcome prices (winner = 1.0, loser = 0.0)
+    /// Note: For binary markets, if the first outcome (index 0) has price ~1.0, YES won.
+    /// If the second outcome (index 1) has price ~1.0, NO won.
+    /// This is based on Polymarket's convention where outcome 0 = YES, outcome 1 = NO for binary markets.
     fn determine_winner_from_prices(&self, prices_str: &str) -> Result<String> {
         // Parse prices like "[\"1\", \"0\"]" or "[\"0.0\", \"1.0\"]"
         let prices: Vec<String> = serde_json::from_str(prices_str)
             .unwrap_or_else(|_| vec![]);
 
         if prices.len() >= 2 {
-            let yes_price: f64 = prices[0].parse().unwrap_or(0.0);
-            let no_price: f64 = prices[1].parse().unwrap_or(0.0);
+            let price_0: f64 = prices[0].parse().unwrap_or(0.0);
+            let price_1: f64 = prices[1].parse().unwrap_or(0.0);
 
+            // In Polymarket binary markets:
+            // - Outcome index 0 typically corresponds to YES
+            // - Outcome index 1 typically corresponds to NO
             // Winner has price ~1.0
-            if yes_price > 0.9 {
+            if price_0 > 0.9 {
+                // First outcome (YES) won
                 return Ok("Yes".to_string());
-            } else if no_price > 0.9 {
+            } else if price_1 > 0.9 {
+                // Second outcome (NO) won
                 return Ok("No".to_string());
             }
         }

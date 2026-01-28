@@ -13,6 +13,9 @@ export default {
         'poly-card': '#16213e',
         'poly-border': '#0f3460',
       },
+      screens: {
+        'xs': '375px', // Extra small devices (iPhone SE, etc.)
+      },
     },
   },
   plugins: [],

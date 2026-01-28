@@ -1,9 +1,25 @@
 import { useSignTypedData, useAccount, useChainId } from 'wagmi'
 import { useCallback, useState } from 'react'
 import type { Address } from 'viem'
+import { keccak256, encodeAbiParameters, getCreate2Address } from 'viem'
 
 // Polymarket CTF Exchange contract on Polygon
 const CTF_EXCHANGE_ADDRESS = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E' as const
+
+// Safe Proxy Factory for deriving proxy wallet address
+const SAFE_FACTORY = '0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b' as const
+const SAFE_INIT_CODE_HASH = '0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf' as const
+
+// Derive the Polymarket Safe proxy wallet address from an EOA
+function deriveSafeWallet(eoaAddress: Address): Address {
+  // Salt = keccak256(abi.encode(address)) - address padded to 32 bytes
+  const salt = keccak256(encodeAbiParameters([{ type: 'address' }], [eoaAddress]))
+  return getCreate2Address({
+    from: SAFE_FACTORY,
+    salt,
+    bytecodeHash: SAFE_INIT_CODE_HASH,
+  })
+}
 
 // EIP-712 Domain for Polymarket orders
 const POLYMARKET_DOMAIN = {
@@ -68,10 +84,16 @@ export interface SignedOrder {
 }
 
 // Generate a random salt for order uniqueness
+// Use a smaller salt that fits in JavaScript's safe integer range (2^53)
+// The official TS SDK uses parseInt() so salt must be a safe integer
 function generateSalt(): bigint {
-  const array = new Uint8Array(32)
+  const array = new Uint8Array(6) // 48 bits is safely under 2^53
   crypto.getRandomValues(array)
-  return BigInt('0x' + Array.from(array).map(b => b.toString(16).padStart(2, '0')).join(''))
+  let salt = BigInt(0)
+  for (const byte of array) {
+    salt = (salt << BigInt(8)) | BigInt(byte)
+  }
+  return salt
 }
 
 // Convert USDC amount to wei (6 decimals)
@@ -123,16 +145,27 @@ export function usePolymarketSigning() {
       const effectivePrice = params.side === 'Yes' ? priceFloat : (1 - priceFloat)
 
       // makerAmount = how much USDC we're spending
-      const makerAmount = sizeWei
+      // Round to 2 decimal places (units of 10000 in 6-decimal representation)
+      // e.g., 1000000 (1 USDC) -> stays 1000000, 1234567 -> 1230000
+      const rawMakerAmount = sizeWei
+      const makerAmount = (rawMakerAmount / BigInt(10000)) * BigInt(10000)
 
       // takerAmount = how many shares we receive (size / price)
-      // Since size is in USDC and price is in USDC per share
-      const sharesWei = BigInt(Math.floor(Number(sizeWei) / effectivePrice))
+      // Round to 4 decimal places (units of 100 in 6-decimal representation)
+      // e.g., 1428571 -> 1428500
+      const rawSharesWei = BigInt(Math.floor(Number(sizeWei) / effectivePrice))
+      const sharesWei = (rawSharesWei / BigInt(100)) * BigInt(100)
+
+      // console.log('Amounts (rounded for precision): maker', makerAmount.toString(), 'taker', sharesWei.toString())
+
+      // Derive proxy wallet address (Polymarket uses Safe proxies for browser wallets)
+      const proxyAddress = deriveSafeWallet(address as Address)
+      // console.log('EOA:', address, '-> Proxy:', proxyAddress)
 
       const orderMessage = {
         salt: salt,
-        maker: address as Address,
-        signer: address as Address,
+        maker: proxyAddress, // Proxy wallet holds the funds
+        signer: address as Address, // EOA signs the order
         taker: '0x0000000000000000000000000000000000000000' as Address, // Open order
         tokenId: BigInt(params.tokenId),
         makerAmount: makerAmount,
@@ -141,7 +174,7 @@ export function usePolymarketSigning() {
         nonce: BigInt(0), // Use 0 for first order, backend can track
         feeRateBps: BigInt(0), // No additional fee
         side: OrderSide.BUY, // Always buying
-        signatureType: SignatureType.EOA,
+        signatureType: SignatureType.POLY_GNOSIS_SAFE, // Browser wallet with Safe proxy
       }
 
       // Sign the typed data
@@ -154,7 +187,7 @@ export function usePolymarketSigning() {
 
       return {
         salt: salt.toString(),
-        maker: address,
+        maker: proxyAddress,
         signer: address,
         taker: '0x0000000000000000000000000000000000000000',
         tokenId: params.tokenId,
@@ -164,7 +197,7 @@ export function usePolymarketSigning() {
         nonce: '0',
         feeRateBps: '0',
         side: OrderSide.BUY,
-        signatureType: SignatureType.EOA,
+        signatureType: SignatureType.POLY_GNOSIS_SAFE,
         signature,
       }
     } catch (err) {

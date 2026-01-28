@@ -1,0 +1,38 @@
+Polymarket CLOB WebSocket Notes
+================================
+
+URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+Limits:
+- Max tokens per connection: 500
+- Ping required every 10 seconds to keep connection alive
+- Unsubscribe not supported - must reconnect to change subscriptions
+
+Current Usage (typical):
+- Sniper opportunities: ~50-100 tokens
+- Open positions: ~50-200 tokens
+- After deduplication: ~100 tokens total (well under 500 limit)
+
+Subscribe Message Format:
+{
+  "assets_ids": ["token_id_1", "token_id_2"],
+  "type": "market"
+}
+
+Price Change Event Format (updated Sept 2025):
+{
+  "event_type": "price_change",
+  "market": "0x...",
+  "timestamp": 1234567890000,
+  "price_changes": [{
+    "asset_id": "token_id",
+    "best_bid": "0.52",
+    "best_ask": "0.53",
+    "changes": [...]
+  }]
+}
+
+Notes:
+- price_changes is now an array (schema changed Sept 15, 2025)
+- Mid price calculated as (best_bid + best_ask) / 2
+- No authentication required for market data

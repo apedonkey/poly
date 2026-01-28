@@ -6,7 +6,9 @@ import type {
   Position,
   BotStats,
   ExecuteTradeRequest,
-  PaperTradeRequest,
+  AutoTradingSettings,
+  AutoTradeLog,
+  AutoTradingStats,
 } from '../types'
 
 const API_BASE = '/api'
@@ -132,23 +134,11 @@ export async function executeTrade(
   })
 }
 
-export async function executePaperTrade(
-  sessionToken: string,
-  request: PaperTradeRequest
-): Promise<{ success: boolean; position_id?: number; message?: string }> {
-  return fetchJson(`${API_BASE}/trades/paper`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${sessionToken}`,
-    },
-    body: JSON.stringify(request),
-  })
-}
-
 // Signed order request for external wallet live trading
 export interface SignedOrderRequest {
   market_id: string
   question: string
+  slug?: string
   side: 'Yes' | 'No'
   size_usdc: string
   entry_price: string
@@ -200,13 +190,14 @@ function base64urlDecode(str: string): Uint8Array {
   return bytes
 }
 
-// Helper to encode to base64url
+// Helper to encode to base64url (with padding to match Polymarket's Python client)
 function base64urlEncode(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
   let binary = ''
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i])
   }
+  // Keep padding (=) - Polymarket expects padded base64url
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_')
 }
 
@@ -235,7 +226,7 @@ export async function submitOrderToClob(
       signatureType: signedOrder.signatureType,
       signature: signedOrder.signature,
     },
-    owner: walletAddress,
+    owner: signedOrder.maker,  // Use maker (proxy) address as owner
     orderType: 'FOK',
   }
 
@@ -300,7 +291,7 @@ export async function submitOrderToClob(
 // Record a position after browser-side CLOB submission
 export async function recordPosition(
   sessionToken: string,
-  request: Omit<SignedOrderRequest, 'signed_order'> & { order_id?: string; end_date?: string }
+  request: Omit<SignedOrderRequest, 'signed_order'> & { order_id?: string; end_date?: string; slug?: string }
 ): Promise<{ success: boolean; position_id?: number; message?: string }> {
   return fetchJson(`${API_BASE}/trades/record`, {
     method: 'POST',
@@ -308,6 +299,171 @@ export async function recordPosition(
       Authorization: `Bearer ${sessionToken}`,
     },
     body: JSON.stringify(request),
+  })
+}
+
+// Close position response (supports partial sells)
+export interface ClosePositionResponse {
+  success: boolean
+  pnl?: string                // PnL from this specific sell
+  remaining_shares?: string   // Shares remaining after this sell
+  is_fully_closed: boolean    // Whether position is now fully closed
+  total_realized_pnl?: string // Total realized PnL from all partial sells
+}
+
+// Close a position (mark as sold) - supports full or partial sells
+export async function closePosition(
+  sessionToken: string,
+  positionId: number,
+  exitPrice: string,
+  orderId?: string,
+  sellShares?: string  // If provided, sell only this many shares (partial sell)
+): Promise<ClosePositionResponse> {
+  return fetchJson(`${API_BASE}/positions/${positionId}/close`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({
+      exit_price: exitPrice,
+      order_id: orderId,
+      sell_shares: sellShares,
+    }),
+  })
+}
+
+// Update token_id for a position (backfill for existing positions)
+export async function updatePositionTokenId(
+  sessionToken: string,
+  positionId: number,
+  tokenId: string
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/positions/${positionId}/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ token_id: tokenId }),
+  })
+}
+
+// Update entry price for a position (fix incorrect entry prices)
+export async function updatePositionEntryPrice(
+  sessionToken: string,
+  positionId: number,
+  entryPrice: string
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/positions/${positionId}/entry-price`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ entry_price: entryPrice }),
+  })
+}
+
+// Fetch market data from Polymarket to get token IDs
+export async function fetchMarketTokenIds(conditionId: string): Promise<{ yes_token_id: string; no_token_id: string } | null> {
+  try {
+    const response = await fetch(`https://clob.polymarket.com/markets/${conditionId}`)
+    if (!response.ok) return null
+
+    const data = await response.json()
+    // The market response contains tokens array with YES and NO tokens
+    if (data.tokens && data.tokens.length >= 2) {
+      const yesToken = data.tokens.find((t: { outcome: string }) => t.outcome === 'Yes')
+      const noToken = data.tokens.find((t: { outcome: string }) => t.outcome === 'No')
+      if (yesToken && noToken) {
+        return {
+          yes_token_id: yesToken.token_id,
+          no_token_id: noToken.token_id,
+        }
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+// Redeem a resolved winning position (claim USDC)
+export async function redeemPosition(
+  sessionToken: string,
+  positionId: number
+): Promise<{ success: boolean; transaction_id?: string; message?: string }> {
+  return fetchJson(`${API_BASE}/positions/${positionId}/redeem`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+// Auto-Trading endpoints
+export async function getAutoTradingSettings(
+  sessionToken: string
+): Promise<{ settings: AutoTradingSettings }> {
+  return fetchJson(`${API_BASE}/auto-trading/settings`, {
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function updateAutoTradingSettings(
+  sessionToken: string,
+  settings: Partial<AutoTradingSettings>
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/auto-trading/settings`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify(settings),
+  })
+}
+
+export async function enableAutoTrading(
+  sessionToken: string,
+  password: string
+): Promise<{ success: boolean; message?: string }> {
+  return fetchJson(`${API_BASE}/auto-trading/enable`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ password }),
+  })
+}
+
+export async function disableAutoTrading(sessionToken: string): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/auto-trading/disable`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function getAutoTradingHistory(
+  sessionToken: string,
+  limit?: number
+): Promise<{ history: AutoTradeLog[] }> {
+  const params = limit ? `?limit=${limit}` : ''
+  return fetchJson(`${API_BASE}/auto-trading/history${params}`, {
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function getAutoTradingStats(
+  sessionToken: string
+): Promise<{ stats: AutoTradingStats }> {
+  return fetchJson(`${API_BASE}/auto-trading/stats`, {
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
   })
 }
 

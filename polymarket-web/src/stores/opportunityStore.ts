@@ -4,6 +4,7 @@ import type { Opportunity } from '../types'
 
 export type FilterType = 'all' | 'sniper' | 'nobias' | 'crypto' | 'sports'
 export type SortType = 'time' | 'edge' | 'return' | 'liquidity'
+export type SideFilter = 'all' | 'no' | 'yes'
 
 // Use word boundary matching for precise detection
 const matchesWord = (text: string, word: string) => {
@@ -115,11 +116,19 @@ interface OpportunityState {
   opportunities: Opportunity[]
   filter: FilterType
   sortBy: SortType
+  sideFilter: SideFilter
+  scanReceivedAt: number | null  // Local timestamp when we received scan_status
+  scanElapsedAtReceive: number   // How many seconds had elapsed when we received scan_status
+  scanIntervalSeconds: number    // Scan interval from backend
   setOpportunities: (opportunities: Opportunity[]) => void
+  setScanStatus: (lastScanAt: number, intervalSeconds: number) => void
   setFilter: (filter: FilterType) => void
   setSortBy: (sortBy: SortType) => void
+  setSideFilter: (sideFilter: SideFilter) => void
   getFiltered: () => Opportunity[]
   getCounts: () => Record<FilterType, number>
+  updatePrice: (tokenId: string, price: string) => void
+  updatePrices: (updates: Map<string, string>) => void
 }
 
 export const useOpportunityStore = create<OpportunityState>()(
@@ -128,13 +137,43 @@ export const useOpportunityStore = create<OpportunityState>()(
       opportunities: [],
       filter: 'all',
       sortBy: 'time',
+      sideFilter: 'all',
+      scanReceivedAt: null,
+      scanElapsedAtReceive: 0,
+      scanIntervalSeconds: 60,
       setOpportunities: (opportunities) => set({ opportunities }),
+      setScanStatus: (lastScanAt, intervalSeconds) => {
+        // Calculate how much time elapsed on the backend since the scan
+        // We use this offset to avoid clock drift issues
+        const now = Date.now()
+        const elapsedOnBackend = Math.max(0, (now - lastScanAt) / 1000)
+        // Cap at interval to handle edge cases (backend clock ahead, etc.)
+        const cappedElapsed = Math.min(elapsedOnBackend, intervalSeconds)
+        set({
+          scanReceivedAt: now,
+          scanElapsedAtReceive: cappedElapsed,
+          scanIntervalSeconds: intervalSeconds
+        })
+      },
       setFilter: (filter) => set({ filter }),
       setSortBy: (sortBy) => set({ sortBy }),
+      setSideFilter: (sideFilter) => set({ sideFilter }),
+      updatePrice: (tokenId, price) =>
+        set((state) => ({
+          opportunities: state.opportunities.map((opp) =>
+            opp.token_id === tokenId ? { ...opp, entry_price: price } : opp
+          ),
+        })),
+      // Batch update multiple prices at once (reduces re-renders)
+      updatePrices: (updates) =>
+        set((state) => ({
+          opportunities: state.opportunities.map((opp) => {
+            const newPrice = opp.token_id ? updates.get(opp.token_id) : undefined
+            return newPrice ? { ...opp, entry_price: newPrice } : opp
+          }),
+        })),
   getFiltered: () => {
-    const { opportunities, filter } = get()
-
-    const { sortBy } = get()
+    const { opportunities, filter, sortBy, sideFilter } = get()
 
     // Helper to sort opportunities based on current sortBy setting
     const sortOpportunities = (arr: Opportunity[]) => {
@@ -156,24 +195,38 @@ export const useOpportunityStore = create<OpportunityState>()(
       })
     }
 
+    // Helper to apply side filter
+    const applySideFilter = (arr: Opportunity[]) => {
+      if (sideFilter === 'no') return arr.filter((o) => o.side === 'No')
+      if (sideFilter === 'yes') return arr.filter((o) => o.side === 'Yes')
+      return arr
+    }
+
+    let result: Opportunity[]
     switch (filter) {
       case 'sniper':
-        return sortOpportunities(opportunities.filter((o) =>
+        result = opportunities.filter((o) =>
           o.strategy === 'ResolutionSniper' &&
           !isCrypto(o) &&
           !isSports(o) &&
           o.time_to_close_hours !== null &&
           o.time_to_close_hours <= 12
-        ))
+        )
+        break
       case 'nobias':
-        return sortOpportunities(opportunities.filter((o) => o.strategy === 'NoBias'))
+        result = opportunities.filter((o) => o.strategy === 'NoBias')
+        break
       case 'crypto':
-        return sortOpportunities(opportunities.filter(isCrypto))
+        result = opportunities.filter(isCrypto)
+        break
       case 'sports':
-        return sortOpportunities(opportunities.filter(isSports))
+        result = opportunities.filter(isSports)
+        break
       default:
-        return sortOpportunities(opportunities)
+        result = opportunities
     }
+
+    return sortOpportunities(applySideFilter(result))
   },
   getCounts: () => {
     const { opportunities } = get()
@@ -195,7 +248,7 @@ export const useOpportunityStore = create<OpportunityState>()(
     }),
     {
       name: 'opportunity-preferences',
-      partialize: (state) => ({ filter: state.filter, sortBy: state.sortBy }),
+      partialize: (state) => ({ filter: state.filter, sortBy: state.sortBy, sideFilter: state.sideFilter }),
     }
   )
 )

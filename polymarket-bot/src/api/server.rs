@@ -2,8 +2,9 @@
 
 use crate::api::routes;
 use crate::api::ws::ws_handler;
+use crate::services::{KeyStore, PriceUpdate, PriceUpdateTx};
+use crate::types::{ClarificationAlert, DisputeAlert, Opportunity};
 use crate::{Config, Database, Scanner, StrategyRunner};
-use crate::types::Opportunity;
 use anyhow::Result;
 use axum::{
     http::{header, Method},
@@ -14,6 +15,13 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+/// Scan status info for frontend progress bar
+#[derive(Debug, Clone)]
+pub struct ScanStatus {
+    pub scan_interval_seconds: u64,
+    pub last_scan_at: i64, // Unix timestamp ms
+}
 
 /// Shared application state
 #[derive(Clone)]
@@ -26,6 +34,18 @@ pub struct AppState {
     pub opportunities: Arc<RwLock<Vec<Opportunity>>>,
     /// Broadcast channel for opportunity updates
     pub opportunity_tx: broadcast::Sender<Vec<Opportunity>>,
+    /// Broadcast channel for real-time price updates
+    pub price_tx: PriceUpdateTx,
+    /// Broadcast channel for scan status updates
+    pub scan_status_tx: broadcast::Sender<ScanStatus>,
+    /// Timestamp of last completed scan (ms)
+    pub last_scan_at: Arc<RwLock<i64>>,
+    /// In-memory key store for auto-trading (decrypted private keys)
+    pub key_store: KeyStore,
+    /// Broadcast channel for clarification alerts
+    pub clarification_tx: broadcast::Sender<Vec<ClarificationAlert>>,
+    /// Broadcast channel for dispute alerts
+    pub dispute_tx: broadcast::Sender<Vec<DisputeAlert>>,
 }
 
 impl AppState {
@@ -34,7 +54,11 @@ impl AppState {
         let scanner = Scanner::new(config.clone());
         let runner = StrategyRunner::new(&config);
 
-        let (opportunity_tx, _) = broadcast::channel(16);
+        let (opportunity_tx, _) = broadcast::channel(64); // Higher capacity for large opportunity lists
+        let (price_tx, _) = broadcast::channel(256); // Higher capacity for frequent price updates
+        let (scan_status_tx, _) = broadcast::channel(16);
+        let (clarification_tx, _) = broadcast::channel(32);
+        let (dispute_tx, _) = broadcast::channel(32);
 
         Ok(Self {
             db: Arc::new(db),
@@ -43,12 +67,38 @@ impl AppState {
             runner: Arc::new(runner),
             opportunities: Arc::new(RwLock::new(Vec::new())),
             opportunity_tx,
+            price_tx,
+            scan_status_tx,
+            last_scan_at: Arc::new(RwLock::new(0)),
+            key_store: KeyStore::new(),
+            clarification_tx,
+            dispute_tx,
         })
     }
 
     /// Subscribe to opportunity updates
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<Opportunity>> {
         self.opportunity_tx.subscribe()
+    }
+
+    /// Subscribe to real-time price updates
+    pub fn subscribe_prices(&self) -> broadcast::Receiver<PriceUpdate> {
+        self.price_tx.subscribe()
+    }
+
+    /// Subscribe to scan status updates
+    pub fn subscribe_scan_status(&self) -> broadcast::Receiver<ScanStatus> {
+        self.scan_status_tx.subscribe()
+    }
+
+    /// Subscribe to clarification alerts
+    pub fn subscribe_clarifications(&self) -> broadcast::Receiver<Vec<ClarificationAlert>> {
+        self.clarification_tx.subscribe()
+    }
+
+    /// Subscribe to dispute alerts
+    pub fn subscribe_disputes(&self) -> broadcast::Receiver<Vec<DisputeAlert>> {
+        self.dispute_tx.subscribe()
     }
 }
 
@@ -57,7 +107,7 @@ pub fn create_app(state: AppState) -> Router {
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     // API routes
@@ -73,14 +123,38 @@ pub fn create_app(state: AppState) -> Router {
         // Position routes
         .route("/positions", get(routes::positions::list_positions))
         .route("/positions/stats", get(routes::positions::get_stats))
+        .route("/positions/:id/close", post(routes::positions::close_position))
+        .route("/positions/:id/redeem", post(routes::positions::redeem_position))
+        .route("/positions/:id/token", post(routes::positions::update_token_id))
+        .route("/positions/:id/entry-price", post(routes::positions::update_entry_price))
         // Trade routes
         .route("/trades/execute", post(routes::trades::execute_trade))
-        .route("/trades/paper", post(routes::trades::paper_trade))
         .route("/trades/signed", post(routes::trades::execute_signed_trade))
         .route("/trades/record", post(routes::trades::record_position))
+        .route("/trades/submit-order", post(routes::trades::submit_sdk_order))
+        .route("/trades/enable", post(routes::trades::enable_trading))
+        // Builder relay routes
+        .route("/builder/sign", post(routes::builder::sign_builder_request))
+        .route("/builder/relay", post(routes::builder::relay_proxy))
+        // Relay proxy routes (for SDK to use)
+        .route("/relay/submit", post(routes::builder::relay_submit))
+        .route("/relay/nonce", get(routes::builder::relay_nonce))
+        .route("/relay/relay", get(routes::builder::relay_address))
+        .route("/relay/deployed", get(routes::builder::relay_deployed))
+        .route("/relay/transaction", get(routes::builder::relay_transaction))
         // CLOB authentication routes
         .route("/auth/time", get(routes::clob_auth::get_server_time))
-        .route("/auth/derive-api-key", post(routes::clob_auth::derive_api_key));
+        .route("/auth/derive-api-key", post(routes::clob_auth::derive_api_key))
+        // Discord webhook routes
+        .route("/discord/alerts", post(routes::discord::send_alerts))
+        // Auto-trading routes
+        .route("/auto-trading/settings", get(routes::auto_trading::get_settings))
+        .route("/auto-trading/settings", axum::routing::put(routes::auto_trading::update_settings))
+        .route("/auto-trading/enable", post(routes::auto_trading::enable))
+        .route("/auto-trading/disable", post(routes::auto_trading::disable))
+        .route("/auto-trading/history", get(routes::auto_trading::get_history))
+        .route("/auto-trading/stats", get(routes::auto_trading::get_stats))
+        .route("/auto-trading/status", get(routes::auto_trading::get_status));
 
     Router::new()
         .nest("/api", api_routes)

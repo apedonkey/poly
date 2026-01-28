@@ -16,7 +16,12 @@
     "lucide-react": "^0.460.0",
     "wagmi": "^2.14.0",
     "viem": "^2.21.0",
-    "@rainbow-me/rainbowkit": "^2.2.0"
+    "@rainbow-me/rainbowkit": "^2.2.0",
+    "@polymarket/clob-client": "^5.2.1",
+    "@polymarket/relayer-client": "^3.0.0",
+    "ethers": "^5.7.1",
+    "buffer": "^6.0.3",
+    "html2canvas": "^1.4.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

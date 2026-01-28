@@ -37,6 +37,14 @@ pub struct Config {
 
     /// NO bias strategy settings
     pub no_bias: NoBiasConfig,
+
+    /// Discord webhook URL for sniper alerts (optional)
+    pub discord_webhook_url: Option<String>,
+
+    /// Polymarket Builder credentials (for relay service)
+    pub builder_api_key: Option<String>,
+    pub builder_secret: Option<String>,
+    pub builder_passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +140,13 @@ impl Config {
         let polygon_rpc_url = env::var("POLYGON_RPC_URL")
             .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
+        let discord_webhook_url = env::var("DISCORD_WEBHOOK_URL").ok().filter(|s| !s.is_empty());
+
+        // Builder credentials for relay service
+        let builder_api_key = env::var("POLY_BUILDER_API_KEY").ok().filter(|s| !s.is_empty());
+        let builder_secret = env::var("POLY_BUILDER_SECRET").ok().filter(|s| !s.is_empty());
+        let builder_passphrase = env::var("POLY_BUILDER_PASSPHRASE").ok().filter(|s| !s.is_empty());
+
         // Validate configuration
         if !paper_trading && private_key.is_none() {
             anyhow::bail!("POLYMARKET_PRIVATE_KEY required for live trading");
@@ -148,6 +163,10 @@ impl Config {
             min_liquidity,
             sniper: SniperConfig::default(),
             no_bias: NoBiasConfig::default(),
+            discord_webhook_url,
+            builder_api_key,
+            builder_secret,
+            builder_passphrase,
         })
     }
 

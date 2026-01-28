@@ -16,4 +16,16 @@ export default defineConfig({
       },
     },
   },
+  // Required for @polymarket/clob-client in browser
+  optimizeDeps: {
+    include: ['buffer'],
+  },
+  resolve: {
+    alias: {
+      buffer: 'buffer/',
+    },
+  },
+  define: {
+    'global': 'globalThis',
+  },
 })

@@ -13,6 +13,8 @@ pub struct TrackedMarket {
     pub question: String,
     pub slug: String,
     pub resolution_source: Option<String>,
+    /// Full market description containing resolution rules
+    pub description: Option<String>,
     pub end_date: Option<DateTime<Utc>>,
     pub yes_price: Decimal,
     pub no_price: Decimal,
@@ -108,9 +110,107 @@ pub struct Opportunity {
     pub volume: Decimal,
     pub category: Option<String>,
     pub resolution_source: Option<String>,
+    /// Full market description containing resolution rules
+    pub description: Option<String>,
     pub recommendation: String,
     /// Token ID for CLOB trading (YES or NO token depending on side)
     pub token_id: Option<String>,
+    /// Whether the opportunity currently meets all filter criteria.
+    /// Updated in real-time as prices change. False = temporarily outside thresholds.
+    #[serde(default = "default_meets_criteria")]
+    pub meets_criteria: bool,
+}
+
+fn default_meets_criteria() -> bool {
+    true
+}
+
+impl Opportunity {
+    /// Check if this opportunity belongs in the Sniper section
+    /// (ResolutionSniper + NOT crypto + NOT sports + closing within 12h)
+    pub fn is_sniper_section(&self) -> bool {
+        self.strategy == StrategyType::ResolutionSniper
+            && !self.is_crypto()
+            && !self.is_sports()
+            && self.time_to_close_hours.map(|h| h <= 12.0).unwrap_or(false)
+    }
+
+    /// Helper for word boundary matching without regex
+    fn contains_word(text: &str, word: &str) -> bool {
+        let text = text.to_lowercase();
+        let word = word.to_lowercase();
+
+        for (i, _) in text.match_indices(&word) {
+            let before_ok = i == 0 || !text.chars().nth(i - 1).unwrap_or(' ').is_alphanumeric();
+            let after_ok = i + word.len() >= text.len()
+                || !text.chars().nth(i + word.len()).unwrap_or(' ').is_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if opportunity is crypto-related
+    pub fn is_crypto(&self) -> bool {
+        let q = &self.question;
+        let cat = self.category.as_deref().unwrap_or("").to_lowercase();
+
+        if cat == "crypto" || cat == "cryptocurrency" {
+            return true;
+        }
+
+        // Match crypto keywords with word boundaries
+        let crypto_keywords = [
+            "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "ripple",
+            "dogecoin", "doge", "cardano", "ada", "polkadot", "dot", "avalanche",
+            "avax", "chainlink", "link", "polygon", "matic", "litecoin", "ltc",
+            "crypto", "cryptocurrency",
+        ];
+
+        crypto_keywords.iter().any(|kw| Self::contains_word(q, kw))
+    }
+
+    /// Check if opportunity is sports-related
+    pub fn is_sports(&self) -> bool {
+        let q = self.question.to_lowercase();
+        let cat = self.category.as_deref().unwrap_or("").to_lowercase();
+
+        if cat == "sports" {
+            return true;
+        }
+
+        // Sports keywords (simple contains is fine for multi-word phrases)
+        let sports_keywords = [
+            "spread:", "moneyline", "over/under", "fight", "fighter", "knockout",
+            "submission", "rounds", "decision", "unanimous",
+            "nba", "nfl", "mlb", "nhl", "mls", "ufc", "bellator", "pga", "atp", "wta",
+            "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+            "champions league", "europa league", "super bowl", "world series",
+            "stanley cup", "world cup",
+        ];
+
+        if sports_keywords.iter().any(|kw| q.contains(kw)) {
+            return true;
+        }
+
+        // Check for "vs" pattern (Team vs Team)
+        if q.contains(" vs ") || q.contains(" vs.") {
+            return true;
+        }
+
+        // Check for KO/TKO with word boundaries
+        if Self::contains_word(&q, "ko") || Self::contains_word(&q, "tko") {
+            return true;
+        }
+
+        // Check for O/U pattern
+        if Self::contains_word(&q, "o/u") {
+            return true;
+        }
+
+        false
+    }
 }
 
 impl Opportunity {
@@ -128,6 +228,132 @@ impl Opportunity {
     pub fn price_cents(&self) -> i32 {
         let price_f64: f64 = self.entry_price.try_into().unwrap_or(0.0);
         (price_f64 * 100.0).round() as i32
+    }
+
+    /// Recalculate opportunity metrics after a price change.
+    /// Updates `meets_criteria` field - returns the new value.
+    /// Opportunity is kept in list either way so it can reactivate if price moves back.
+    pub fn recalculate_with_price(&mut self, new_price: Decimal) -> bool {
+        let price_f64: f64 = new_price.try_into().unwrap_or(0.0);
+
+        // Avoid division by zero
+        if price_f64 <= 0.0 || price_f64 >= 1.0 {
+            self.meets_criteria = false;
+            return false;
+        }
+
+        self.entry_price = new_price;
+
+        self.meets_criteria = match self.strategy {
+            StrategyType::ResolutionSniper => {
+                self.recalculate_sniper(price_f64)
+            }
+            StrategyType::NoBias => {
+                self.recalculate_no_bias(price_f64)
+            }
+        };
+
+        self.meets_criteria
+    }
+
+    /// Recalculate sniper opportunity metrics
+    fn recalculate_sniper(&mut self, price: f64) -> bool {
+        // Sniper config defaults
+        const MIN_FAVORITE_PRICE: f64 = 0.70;
+        const MAX_FAVORITE_PRICE: f64 = 0.90;
+        const MIN_EV: f64 = 0.05;
+
+        // Check price range filter
+        if price < MIN_FAVORITE_PRICE || price > MAX_FAVORITE_PRICE {
+            return false;
+        }
+
+        // Get accuracy based on hours (uses same interpolation as strategy)
+        let hours = self.time_to_close_hours.unwrap_or(12.0);
+        let accuracy = Self::accuracy_at_hours(hours);
+
+        // Recalculate expected return: (1 - price) / price
+        self.expected_return = (1.0 - price) / price;
+
+        // Recalculate EV: (win_prob × profit) - (lose_prob × loss)
+        self.edge = (accuracy * (1.0 - price)) - ((1.0 - accuracy) * price);
+
+        // Check EV threshold
+        if self.edge < MIN_EV {
+            return false;
+        }
+
+        // Update confidence (may have changed if hours changed, but typically static during session)
+        self.confidence = accuracy;
+
+        // Update recommendation string
+        let no_bias_bonus = matches!(self.side, Side::No);
+        self.recommendation = format!(
+            "BUY {} at {:.0}c | {:.1}% return | {:.1}% EV | {:.1}h left{}",
+            self.side,
+            price * 100.0,
+            self.expected_return * 100.0,
+            self.edge * 100.0,
+            hours,
+            if no_bias_bonus { " [NO BIAS+]" } else { "" }
+        );
+
+        true
+    }
+
+    /// Recalculate NO bias opportunity metrics
+    /// Note: NO bias opportunities are NOT filtered out in real-time since they're
+    /// longer-term plays. We just update the metrics for display.
+    fn recalculate_no_bias(&mut self, price: f64) -> bool {
+        // NO bias config defaults
+        const HISTORICAL_NO_RATE: f64 = 0.784;
+
+        // Recalculate expected return
+        self.expected_return = (1.0 - price) / price;
+
+        // Recalculate edge: historical NO rate - current NO price
+        self.edge = HISTORICAL_NO_RATE - price;
+
+        // Update recommendation string
+        let hours_str = self.time_to_close_hours
+            .map(|h| {
+                if h > 24.0 * 7.0 {
+                    format!("{:.0} weeks", h / (24.0 * 7.0))
+                } else if h > 24.0 {
+                    format!("{:.0} days", h / 24.0)
+                } else {
+                    format!("{:.0}h", h)
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        self.recommendation = format!(
+            "BUY NO at {:.0}c | {:.1}% edge vs {:.1}% base rate | {} left",
+            price * 100.0,
+            self.edge * 100.0,
+            HISTORICAL_NO_RATE * 100.0,
+            hours_str
+        );
+
+        // NO bias always stays visible - filtering happens at next scan
+        true
+    }
+
+    /// Get historical accuracy at given hours before close (same as sniper strategy)
+    fn accuracy_at_hours(hours: f64) -> f64 {
+        if hours <= 4.0 {
+            0.953
+        } else if hours <= 12.0 {
+            // Linear interpolation between 4h (95.3%) and 12h (90.6%)
+            let t = (hours - 4.0) / 8.0;
+            0.953 - (t * (0.953 - 0.906))
+        } else if hours <= 24.0 {
+            // Linear interpolation between 12h (90.6%) and 24h (89.4%)
+            let t = (hours - 12.0) / 12.0;
+            0.906 - (t * (0.906 - 0.894))
+        } else {
+            0.893 // Baseline for > 24 hours
+        }
     }
 
     /// Get Polymarket URL for this opportunity
@@ -179,8 +405,11 @@ pub enum OrderStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub id: i64,
+    /// Wallet address that owns this position
+    pub wallet_address: String,
     pub market_id: String,
     pub question: String,
+    pub slug: Option<String>,
     pub side: Side,
     pub entry_price: Decimal,
     pub size: Decimal,
@@ -193,6 +422,18 @@ pub struct Position {
     pub is_paper: bool,
     /// When the market ends/closes
     pub end_date: Option<DateTime<Utc>>,
+    /// Token ID for CLOB trading (needed to sell the position)
+    pub token_id: Option<String>,
+    /// Order ID from CLOB (for querying fill price)
+    pub order_id: Option<String>,
+    /// Shares remaining (for partial sells). None means full position (backward compat)
+    pub remaining_size: Option<Decimal>,
+    /// Cumulative PnL from partial sells
+    pub realized_pnl: Option<Decimal>,
+    /// Total shares sold so far
+    pub total_sold_size: Option<Decimal>,
+    /// Weighted average exit price from partial sells
+    pub avg_exit_price: Option<Decimal>,
 }
 
 impl Position {
@@ -264,4 +505,65 @@ impl BotStats {
             (self.no_bias_wins as f64 / self.no_bias_trades as f64) * 100.0
         }
     }
+}
+
+// ==================== CLARIFICATION MONITOR TYPES ====================
+
+/// Alert when a market's description/clarification has been updated
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarificationAlert {
+    pub market_id: String,
+    pub condition_id: String,
+    pub question: String,
+    pub slug: String,
+    pub old_description_hash: String,
+    /// First 500 chars of new description
+    pub new_description_preview: String,
+    /// Unix timestamp when detected
+    pub detected_at: i64,
+    pub current_yes_price: Decimal,
+    pub current_no_price: Decimal,
+    pub liquidity: Decimal,
+}
+
+// ==================== UMA DISPUTE TRACKER TYPES ====================
+
+/// Status of a UMA dispute
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisputeStatus {
+    /// Initial proposal, 2hr challenge window
+    Proposed,
+    /// First dispute, auto-reset
+    Disputed,
+    /// Escalated to UMA DVM voting
+    DvmVote,
+}
+
+impl fmt::Display for DisputeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DisputeStatus::Proposed => write!(f, "Proposed"),
+            DisputeStatus::Disputed => write!(f, "Disputed"),
+            DisputeStatus::DvmVote => write!(f, "DVM Vote"),
+        }
+    }
+}
+
+/// Alert for an active UMA dispute on a Polymarket market
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisputeAlert {
+    pub market_id: String,
+    pub condition_id: String,
+    pub question: String,
+    pub slug: String,
+    pub dispute_status: DisputeStatus,
+    /// "Yes" or "No"
+    pub proposed_outcome: String,
+    /// When the dispute started
+    pub dispute_timestamp: i64,
+    /// Estimated when DVM vote ends
+    pub estimated_resolution: i64,
+    pub current_yes_price: Decimal,
+    pub current_no_price: Decimal,
+    pub liquidity: Decimal,
 }

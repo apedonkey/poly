@@ -122,8 +122,10 @@ impl NoBiasStrategy {
             volume: market.volume,
             category: market.category.clone(),
             resolution_source: market.resolution_source.clone(),
+            description: market.description.clone(),
             recommendation,
             token_id: market.no_token_id.clone(),
+            meets_criteria: true,
         })
     }
 }

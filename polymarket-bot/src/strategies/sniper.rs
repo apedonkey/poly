@@ -114,8 +114,10 @@ impl SniperStrategy {
             volume: market.volume,
             category: market.category.clone(),
             resolution_source: market.resolution_source.clone(),
+            description: market.description.clone(),
             recommendation,
             token_id,
+            meets_criteria: true,
         })
     }
 

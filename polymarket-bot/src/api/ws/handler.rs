@@ -1,7 +1,8 @@
 //! WebSocket connection handler
 
 use crate::api::server::AppState;
-use crate::types::Opportunity;
+use crate::services::PriceUpdate;
+use crate::types::{ClarificationAlert, DisputeAlert, Opportunity};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -25,6 +26,21 @@ pub enum WsServerMessage {
     Error { message: String },
     #[serde(rename = "pong")]
     Pong,
+    /// Real-time price update for a token
+    #[serde(rename = "price_update")]
+    PriceUpdate(PriceUpdate),
+    /// Scan timing info for progress bar
+    #[serde(rename = "scan_status")]
+    ScanStatus {
+        scan_interval_seconds: u64,
+        last_scan_at: i64,  // Unix timestamp ms
+    },
+    /// Market clarification/description change alerts
+    #[serde(rename = "clarifications")]
+    Clarifications(Vec<ClarificationAlert>),
+    /// UMA dispute alerts
+    #[serde(rename = "disputes")]
+    Disputes(Vec<DisputeAlert>),
 }
 
 /// WebSocket message from client to server
@@ -68,14 +84,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // Send current scan status so client knows where in the cycle we are
+    {
+        let last_scan = *state.last_scan_at.read().await;
+        // Only send if we've had at least one scan
+        if last_scan > 0 {
+            let msg = WsServerMessage::ScanStatus {
+                scan_interval_seconds: state.config.scan_interval_seconds,
+                last_scan_at: last_scan,
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(Message::Text(json)).await;
+            }
+        }
+    }
+
     // Subscribe to opportunity updates
     let mut opportunity_rx = state.subscribe();
+    // Subscribe to price updates
+    let mut price_rx = state.subscribe_prices();
+    // Subscribe to scan status updates
+    let mut scan_status_rx = state.subscribe_scan_status();
+    // Subscribe to clarification alerts
+    let mut clarification_rx = state.subscribe_clarifications();
+    // Subscribe to dispute alerts
+    let mut dispute_rx = state.subscribe_disputes();
 
-    // Spawn task to forward opportunity updates to this client
+    // Spawn task to forward opportunity, price, and scan status updates to this client
     let send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                // Handle broadcast updates
+                // Handle opportunity broadcast updates
                 result = opportunity_rx.recv() => {
                     match result {
                         Ok(opportunities) => {
@@ -87,8 +126,104 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }
                             }
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Opportunity updates can be dropped if client is slow
+                            debug!("Opportunity updates lagged by {} messages", n);
+                        }
                         Err(e) => {
-                            error!("Broadcast receive error: {}", e);
+                            error!("Opportunity broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle price update broadcasts
+                result = price_rx.recv() => {
+                    match result {
+                        Ok(price_update) => {
+                            let msg = WsServerMessage::PriceUpdate(price_update);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Price updates can be dropped if client is slow
+                            debug!("Price updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Price broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle scan status broadcasts
+                result = scan_status_rx.recv() => {
+                    match result {
+                        Ok(status) => {
+                            let msg = WsServerMessage::ScanStatus {
+                                scan_interval_seconds: status.scan_interval_seconds,
+                                last_scan_at: status.last_scan_at,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Scan status updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Scan status broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle clarification alert broadcasts
+                result = clarification_rx.recv() => {
+                    match result {
+                        Ok(alerts) => {
+                            let msg = WsServerMessage::Clarifications(alerts);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Clarification updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Clarification broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle dispute alert broadcasts
+                result = dispute_rx.recv() => {
+                    match result {
+                        Ok(alerts) => {
+                            let msg = WsServerMessage::Disputes(alerts);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Dispute updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Dispute broadcast receive error: {}", e);
                             break;
                         }
                     }

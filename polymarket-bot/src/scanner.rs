@@ -3,7 +3,9 @@
 use crate::config::{Config, GammaApi};
 use crate::types::TrackedMarket;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono_tz::Tz;
+use regex::Regex;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -28,6 +30,9 @@ struct GammaMarket {
     slug: String,
     #[serde(default)]
     resolution_source: Option<String>,
+    /// Full market description containing resolution rules
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     end_date_iso: Option<String>,
     #[serde(default)]
@@ -161,8 +166,8 @@ impl Scanner {
 
     /// Parse a Gamma API market into our TrackedMarket type
     fn parse_market(&self, gm: GammaMarket) -> Option<TrackedMarket> {
-        // Parse end date - try end_date first (full ISO timestamp), then end_date_iso (just date)
-        let end_date = gm
+        // Parse end date from API - try end_date first (full ISO timestamp), then end_date_iso (just date)
+        let api_end_date = gm
             .end_date
             .as_ref()
             .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
@@ -176,6 +181,35 @@ impl Scanner {
                         .map(|dt| dt.with_timezone(&Utc))
                 })
             });
+
+        // Try to extract a more accurate resolution date from the description
+        // This handles cases where the API end_date is wrong (e.g., midnight vs actual event time)
+        let description_end_date = gm
+            .description
+            .as_ref()
+            .and_then(|desc| self.parse_resolution_date_from_description(desc));
+
+        // Use the description date if:
+        // 1. We found one, AND
+        // 2. Either there's no API date, OR the description date is later (more specific)
+        let end_date = match (description_end_date, api_end_date) {
+            (Some(desc_date), Some(api_date)) => {
+                // If description date is later than API date, use it (it's more specific)
+                // e.g., API says midnight, description says 2:30 PM
+                if desc_date > api_date {
+                    debug!(
+                        "Using description date {} instead of API date {} for market",
+                        desc_date, api_date
+                    );
+                    Some(desc_date)
+                } else {
+                    Some(api_date)
+                }
+            }
+            (Some(desc_date), None) => Some(desc_date),
+            (None, Some(api_date)) => Some(api_date),
+            (None, None) => None,
+        };
 
         // Calculate hours until close
         let hours_until_close = end_date.map(|end| {
@@ -231,6 +265,7 @@ impl Scanner {
             question: gm.question,
             slug: event_slug,
             resolution_source: gm.resolution_source,
+            description: gm.description,
             end_date,
             yes_price,
             no_price,
@@ -325,6 +360,92 @@ impl Scanner {
 
         (None, None)
     }
+
+    /// Parse resolution date/time from market description text.
+    /// Looks for common patterns like "by January 28, 2026, 11:59 PM ET"
+    /// Returns None if no valid date is found.
+    fn parse_resolution_date_from_description(&self, description: &str) -> Option<DateTime<Utc>> {
+        // Common date patterns in Polymarket rules
+        // Pattern: "January 28, 2026" or "January 28 2026"
+        let date_pattern = r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})";
+
+        // Pattern: "11:59 PM ET" or "2:30 PM EST" or "14:30 UTC"
+        let time_pattern = r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?\s*(ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT|UTC)?";
+
+        let date_re = Regex::new(date_pattern).ok()?;
+        let time_re = Regex::new(time_pattern).ok()?;
+
+        // Find all date matches
+        let date_caps = date_re.captures(description)?;
+
+        let month_str = date_caps.get(1)?.as_str();
+        let day: u32 = date_caps.get(2)?.as_str().parse().ok()?;
+        let year: i32 = date_caps.get(3)?.as_str().parse().ok()?;
+
+        let month = match month_str.to_lowercase().as_str() {
+            "january" => 1,
+            "february" => 2,
+            "march" => 3,
+            "april" => 4,
+            "may" => 5,
+            "june" => 6,
+            "july" => 7,
+            "august" => 8,
+            "september" => 9,
+            "october" => 10,
+            "november" => 11,
+            "december" => 12,
+            _ => return None,
+        };
+
+        let date = NaiveDate::from_ymd_opt(year, month, day)?;
+
+        // Try to find a time near the date match
+        let (hour, minute, tz_str) = if let Some(time_caps) = time_re.captures(description) {
+            let mut hour: u32 = time_caps.get(1)?.as_str().parse().ok()?;
+            let minute: u32 = time_caps.get(2)?.as_str().parse().ok()?;
+
+            // Handle AM/PM
+            if let Some(ampm) = time_caps.get(3) {
+                let ampm_str = ampm.as_str().to_uppercase();
+                if ampm_str == "PM" && hour != 12 {
+                    hour += 12;
+                } else if ampm_str == "AM" && hour == 12 {
+                    hour = 0;
+                }
+            }
+
+            let tz = time_caps.get(4).map(|m| m.as_str()).unwrap_or("ET");
+            (hour, minute, tz)
+        } else {
+            // Default to 11:59 PM ET if no time specified
+            (23, 59, "ET")
+        };
+
+        let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+        let naive_dt = NaiveDateTime::new(date, time);
+
+        // Convert timezone to UTC
+        let tz: Tz = match tz_str.to_uppercase().as_str() {
+            "ET" | "EST" | "EDT" => "America/New_York".parse().ok()?,
+            "PT" | "PST" | "PDT" => "America/Los_Angeles".parse().ok()?,
+            "CT" | "CST" | "CDT" => "America/Chicago".parse().ok()?,
+            "MT" | "MST" | "MDT" => "America/Denver".parse().ok()?,
+            "UTC" => "UTC".parse().ok()?,
+            _ => "America/New_York".parse().ok()?, // Default to ET
+        };
+
+        // Convert to UTC
+        let local_dt = tz.from_local_datetime(&naive_dt).single()?;
+        let utc_dt = local_dt.with_timezone(&Utc);
+
+        // Only return if the date is in the future
+        if utc_dt > Utc::now() {
+            Some(utc_dt)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +464,54 @@ mod tests {
         let (yes, no) = result.unwrap();
         assert_eq!(yes, Decimal::from_str("0.65").unwrap());
         assert_eq!(no, Decimal::from_str("0.35").unwrap());
+    }
+
+    #[test]
+    fn test_parse_resolution_date_common_format() {
+        let config = Config::from_env().unwrap();
+        let scanner = Scanner::new(config);
+
+        // Test common Polymarket format: "by January 28, 2027, 11:59 PM ET"
+        let desc = "This market will resolve to No if no such statement happens by January 28, 2027, 11:59 PM ET.";
+        let result = scanner.parse_resolution_date_from_description(desc);
+        assert!(result.is_some(), "Should parse date from description");
+
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2027);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 28);
+    }
+
+    #[test]
+    fn test_parse_resolution_date_with_time() {
+        let config = Config::from_env().unwrap();
+        let scanner = Scanner::new(config);
+
+        // Test "at 2:30 PM ET on January 28, 2027"
+        let desc = "Jerome Powell is scheduled to speak at 2:30 PM ET on January 28, 2027.";
+        let result = scanner.parse_resolution_date_from_description(desc);
+        assert!(result.is_some(), "Should parse date with specific time");
+    }
+
+    #[test]
+    fn test_parse_resolution_date_no_time() {
+        let config = Config::from_env().unwrap();
+        let scanner = Scanner::new(config);
+
+        // Test date without time - should default to 11:59 PM
+        let desc = "This market resolves on December 31, 2027.";
+        let result = scanner.parse_resolution_date_from_description(desc);
+        assert!(result.is_some(), "Should parse date without time");
+    }
+
+    #[test]
+    fn test_parse_resolution_date_past_date() {
+        let config = Config::from_env().unwrap();
+        let scanner = Scanner::new(config);
+
+        // Past dates should return None
+        let desc = "This market resolved on January 1, 2020.";
+        let result = scanner.parse_resolution_date_from_description(desc);
+        assert!(result.is_none(), "Past dates should return None");
     }
 }

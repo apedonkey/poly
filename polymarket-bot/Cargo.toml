@@ -26,6 +26,10 @@ rust_decimal_macros = "1.36"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# Regex for parsing resolution rules
+regex = "1.10"
 
 # Logging
 tracing = "0.1"
@@ -57,7 +61,8 @@ tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # WebSocket
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 
 # Session/Auth
 jsonwebtoken = "9.0"
