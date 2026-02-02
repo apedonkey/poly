@@ -3,6 +3,7 @@ import { useAccount } from 'wagmi'
 import { formatUnits } from 'viem'
 import { useWalletStore } from '../stores/walletStore'
 import { rpcCallWithRetry } from '../utils/rpc'
+import { getWalletBalance } from '../api/client'
 
 // USDC.e (bridged) on Polygon - used by Polymarket
 const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'
@@ -12,32 +13,58 @@ interface BalanceData {
   address: string
   usdc_balance: string
   matic_balance: string
+  safe_address?: string
+  safe_usdc_balance?: string
 }
 
 export function useBalance() {
   const { address: wagmiAddress } = useAccount()
-  const { setBalance, isConnected, isExternal } = useWalletStore()
+  const { address: storedAddress, sessionToken, setBalance, isConnected, isExternal } = useWalletStore()
   const [data, setData] = useState<BalanceData | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const lastFetchRef = useRef<number>(0)
 
-  const fetchBalance = useCallback(async () => {
-    // Only fetch for external wallets with a valid address
-    if (!wagmiAddress || !isExternal) {
-      return
-    }
+  // Fetch balance for generated wallets via backend API
+  const fetchGeneratedBalance = useCallback(async () => {
+    if (!sessionToken || !storedAddress || isExternal) return
 
-    // Rate limit - minimum 5 seconds between fetches
     const now = Date.now()
-    if (now - lastFetchRef.current < 5000) {
-      return
+    if (now - lastFetchRef.current < 5000) return
+    lastFetchRef.current = now
+
+    setIsLoading(true)
+    try {
+      const result = await getWalletBalance(sessionToken)
+      const balanceData: BalanceData = {
+        address: result.address,
+        usdc_balance: result.usdc_balance,
+        matic_balance: result.matic_balance,
+        safe_address: result.safe_address,
+        safe_usdc_balance: result.safe_usdc_balance,
+      }
+      setData(balanceData)
+      setBalance({
+        usdc: result.usdc_balance,
+        matic: result.matic_balance,
+      })
+    } catch (err) {
+      console.error('Failed to fetch generated wallet balance:', err)
+    } finally {
+      setIsLoading(false)
     }
+  }, [sessionToken, storedAddress, isExternal, setBalance])
+
+  // Fetch balance for external wallets via RPC
+  const fetchExternalBalance = useCallback(async () => {
+    if (!wagmiAddress || !isExternal) return
+
+    const now = Date.now()
+    if (now - lastFetchRef.current < 5000) return
     lastFetchRef.current = now
 
     setIsLoading(true)
 
     try {
-      // Fetch USDC.e and POL balances with retry/fallback for rate limiting
       const [usdcResult, maticResult] = await Promise.all([
         rpcCallWithRetry({
           jsonrpc: '2.0',
@@ -89,20 +116,44 @@ export function useBalance() {
     }
   }, [wagmiAddress, isExternal, setBalance])
 
-  // Fetch on mount and when address changes
+  const fetchBalance = useCallback(() => {
+    if (isExternal) {
+      return fetchExternalBalance()
+    } else {
+      return fetchGeneratedBalance()
+    }
+  }, [isExternal, fetchExternalBalance, fetchGeneratedBalance])
+
+  // Fetch on mount and when wallet changes
   useEffect(() => {
-    if (wagmiAddress && isConnected() && isExternal) {
+    if (isConnected()) {
       fetchBalance()
     }
-  }, [wagmiAddress, isConnected, isExternal, fetchBalance])
+  }, [isConnected, fetchBalance])
 
-  // Set up polling
+  // Poll every 30 seconds
   useEffect(() => {
-    if (!wagmiAddress || !isConnected() || !isExternal) return
+    if (!isConnected()) return
 
     const interval = setInterval(fetchBalance, 30000)
     return () => clearInterval(interval)
-  }, [wagmiAddress, isConnected, isExternal, fetchBalance])
+  }, [isConnected, fetchBalance])
+
+  // Listen for WebSocket wallet_balance events
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      if (detail?.usdc_balance) {
+        setData((prev) => prev ? { ...prev, usdc_balance: detail.usdc_balance } : null)
+        setBalance({
+          usdc: detail.usdc_balance,
+          matic: data?.matic_balance || '0.00',
+        })
+      }
+    }
+    window.addEventListener('wallet-balance', handler)
+    return () => window.removeEventListener('wallet-balance', handler)
+  }, [setBalance, data?.matic_balance])
 
   return {
     balance: data,

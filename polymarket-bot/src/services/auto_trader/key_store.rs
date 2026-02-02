@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Thread-safe store for decrypted private keys
 #[derive(Clone, Default)]

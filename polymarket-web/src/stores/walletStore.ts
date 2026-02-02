@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware'
 interface WalletBalance {
   usdc: string
   matic: string
+  safe_usdc_balance?: string
 }
 
 interface WalletState {

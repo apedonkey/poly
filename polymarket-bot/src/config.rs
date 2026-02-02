@@ -35,8 +35,8 @@ pub struct Config {
     /// Sniper strategy settings
     pub sniper: SniperConfig,
 
-    /// NO bias strategy settings
-    pub no_bias: NoBiasConfig,
+    /// Mint Maker strategy settings
+    pub mint_maker: MintMakerConfig,
 
     /// Discord webhook URL for sniper alerts (optional)
     pub discord_webhook_url: Option<String>,
@@ -45,6 +45,12 @@ pub struct Config {
     pub builder_api_key: Option<String>,
     pub builder_secret: Option<String>,
     pub builder_passphrase: Option<String>,
+
+    /// Taker fee in basis points (default: 200 = 2%)
+    pub taker_fee_bps: u32,
+
+    /// Slippage tolerance for market orders (default: 0.005 = 0.5%)
+    pub slippage_tolerance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -73,31 +79,44 @@ impl Default for SniperConfig {
     }
 }
 
+/// Mint Maker configuration (defaults = Balanced preset)
 #[derive(Debug, Clone)]
-pub struct NoBiasConfig {
-    /// Historical NO resolution rate (78.4%)
-    pub historical_no_rate: f64,
-    /// Minimum edge required (default: 0.10)
-    pub min_edge: f64,
-    /// Minimum hours until close to avoid overlap with sniper
-    pub min_hours: f64,
-    /// Categories to exclude (fairly priced)
-    pub excluded_categories: Vec<String>,
+pub struct MintMakerConfig {
+    /// Maximum combined cost of YES+NO pair (must be < 1.00 for profit)
+    pub max_pair_cost: f64,
+    /// Minimum spread profit per pair in dollars
+    pub min_spread_profit: f64,
+    /// Offset in cents below mid-price for bids
+    pub bid_offset_cents: u32,
+    /// Max open pairs per market
+    pub max_pairs_per_market: u32,
+    /// Max total open pairs across all markets
+    pub max_total_pairs: u32,
+    /// Seconds before an unfilled order is considered stale
+    pub stale_order_seconds: u64,
+    /// Crypto assets to trade
+    pub assets: Vec<String>,
+    /// How often to rebalance/check (seconds)
+    pub rebalance_interval_seconds: u64,
+    /// Minimum minutes to market close for eligibility
+    pub min_minutes_to_close: f64,
+    /// Maximum minutes to market close for eligibility
+    pub max_minutes_to_close: f64,
 }
 
-impl Default for NoBiasConfig {
+impl Default for MintMakerConfig {
     fn default() -> Self {
         Self {
-            historical_no_rate: 0.784,
-            min_edge: 0.10,
-            min_hours: 12.0,
-            excluded_categories: vec![
-                "Sports".to_string(),
-                "Crypto".to_string(),
-                "NBA".to_string(),
-                "NFL".to_string(),
-                "MLB".to_string(),
-            ],
+            max_pair_cost: 0.98,
+            min_spread_profit: 0.01,
+            bid_offset_cents: 2,
+            max_pairs_per_market: 5,
+            max_total_pairs: 20,
+            stale_order_seconds: 120,
+            assets: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string(), "XRP".to_string()],
+            rebalance_interval_seconds: 10,
+            min_minutes_to_close: 2.0,
+            max_minutes_to_close: 14.0,
         }
     }
 }
@@ -130,7 +149,7 @@ impl Config {
         let scan_interval_seconds = env::var("SCAN_INTERVAL_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
+            .unwrap_or(15);
 
         let min_liquidity = env::var("MIN_LIQUIDITY")
             .ok()
@@ -147,6 +166,17 @@ impl Config {
         let builder_secret = env::var("POLY_BUILDER_SECRET").ok().filter(|s| !s.is_empty());
         let builder_passphrase = env::var("POLY_BUILDER_PASSPHRASE").ok().filter(|s| !s.is_empty());
 
+        // Trading parameters
+        let taker_fee_bps = env::var("TAKER_FEE_BPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200); // Default 2%
+
+        let slippage_tolerance = env::var("SLIPPAGE_TOLERANCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.005); // Default 0.5%
+
         // Validate configuration
         if !paper_trading && private_key.is_none() {
             anyhow::bail!("POLYMARKET_PRIVATE_KEY required for live trading");
@@ -162,11 +192,13 @@ impl Config {
             scan_interval_seconds,
             min_liquidity,
             sniper: SniperConfig::default(),
-            no_bias: NoBiasConfig::default(),
+            mint_maker: MintMakerConfig::default(),
             discord_webhook_url,
             builder_api_key,
             builder_secret,
             builder_passphrase,
+            taker_fee_bps,
+            slippage_tolerance,
         })
     }
 

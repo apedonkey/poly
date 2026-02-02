@@ -59,6 +59,19 @@ export async function unlockWallet(address: string, password: string): Promise<U
   })
 }
 
+export async function exportPrivateKey(
+  sessionToken: string,
+  password: string
+): Promise<{ private_key: string }> {
+  return fetchJson(`${API_BASE}/wallet/export-key`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ password }),
+  })
+}
+
 // Connect external wallet (MetaMask, etc.)
 export async function connectExternalWallet(address: string): Promise<{ address: string; session_token: string }> {
   return fetchJson(`${API_BASE}/wallet/connect`, {
@@ -72,6 +85,8 @@ export interface WalletBalance {
   address: string
   usdc_balance: string
   matic_balance: string
+  safe_address?: string
+  safe_usdc_balance?: string
 }
 
 export async function getWalletBalance(sessionToken?: string, address?: string): Promise<WalletBalance> {
@@ -82,6 +97,36 @@ export async function getWalletBalance(sessionToken?: string, address?: string):
   if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`
 
   return fetchJson(`${API_BASE}/wallet/balance?${params.toString()}`, { headers })
+}
+
+// Deposit USDC from EOA to Safe (generated wallets)
+export async function depositToSafe(
+  sessionToken: string,
+  password: string,
+  amount: string
+): Promise<{ tx_hash: string; safe_address: string; amount: string }> {
+  return fetchJson(`${API_BASE}/wallet/deposit`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ password, amount }),
+  })
+}
+
+// Withdraw USDC from Safe to EOA (generated wallets)
+export async function withdrawFromSafe(
+  sessionToken: string,
+  password: string,
+  amount: string
+): Promise<{ transaction_id: string; safe_address: string; amount: string }> {
+  return fetchJson(`${API_BASE}/wallet/withdraw`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+    body: JSON.stringify({ password, amount }),
+  })
 }
 
 // Opportunities endpoint
@@ -464,6 +509,229 @@ export async function getAutoTradingStats(
     headers: {
       Authorization: `Bearer ${sessionToken}`,
     },
+  })
+}
+
+export interface AutoTradingStatusResponse {
+  enabled: boolean
+  auto_buy_enabled: boolean
+  open_positions: number
+  total_exposure: string
+  daily_pnl: string
+  wallet_balance: string
+}
+
+export async function getAutoTradingStatus(
+  sessionToken: string
+): Promise<AutoTradingStatusResponse> {
+  return fetchJson(`${API_BASE}/auto-trading/status`, {
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+// Open Orders types and endpoints
+export interface OpenOrder {
+  id: string
+  market: string
+  asset_id: string
+  side: string
+  original_size: string
+  size_matched: string
+  price: string
+  status: string
+  created_at?: string
+  expiration?: string
+  order_type: string
+  market_question?: string
+}
+
+export async function getOpenOrders(sessionToken: string): Promise<{ orders: OpenOrder[]; total: number }> {
+  return fetchJson(`${API_BASE}/orders`, {
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function cancelOrder(
+  sessionToken: string,
+  orderId: string
+): Promise<{ success: boolean; message?: string }> {
+  return fetchJson(`${API_BASE}/orders/${orderId}`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function cancelAllOrders(
+  sessionToken: string
+): Promise<{ success: boolean; message?: string }> {
+  return fetchJson(`${API_BASE}/orders/cancel-all`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function cancelMarketOrders(
+  sessionToken: string,
+  marketId: string
+): Promise<{ success: boolean; message?: string }> {
+  return fetchJson(`${API_BASE}/orders/market/${marketId}`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+    },
+  })
+}
+
+export async function getPriceHistory(
+  marketId: string,
+  interval = '1h'
+): Promise<{ t: number; p: number }[]> {
+  return fetchJson(`${API_BASE}/market/prices?market=${encodeURIComponent(marketId)}&interval=${interval}`)
+}
+
+export async function getTickSize(
+  tokenId: string
+): Promise<{ token_id: string; tick_size: string }> {
+  return fetchJson(`${API_BASE}/market/tick-size?token_id=${encodeURIComponent(tokenId)}`)
+}
+
+// Millionaires Club endpoints
+export async function getMcStatus(): Promise<{ status: import('../types').McStatus | null }> {
+  return fetchJson(`${API_BASE}/mc/status`)
+}
+
+export async function getMcScoutLog(limit = 50, offset = 0): Promise<{ logs: import('../types').McScoutResult[]; total: number }> {
+  return fetchJson(`${API_BASE}/mc/scout-log?limit=${limit}&offset=${offset}`)
+}
+
+export async function getMcTrades(limit = 50, offset = 0): Promise<{ trades: import('../types').McTrade[]; total: number }> {
+  return fetchJson(`${API_BASE}/mc/trades?limit=${limit}&offset=${offset}`)
+}
+
+export async function getMcTierHistory(): Promise<{ history: import('../types').McTierTransition[] }> {
+  return fetchJson(`${API_BASE}/mc/tier-history`)
+}
+
+export async function updateMcConfig(config: { bankroll?: string; mode?: string }): Promise<{ success: boolean; message: string }> {
+  return fetchJson(`${API_BASE}/mc/config`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  })
+}
+
+// Mint Maker endpoints
+export async function getMintMakerSettings(
+  sessionToken: string
+): Promise<{ settings: import('../types').MintMakerSettings }> {
+  return fetchJson(`${API_BASE}/mint-maker/settings`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+}
+
+export async function updateMintMakerSettings(
+  sessionToken: string,
+  settings: Record<string, unknown>
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/mint-maker/settings`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    body: JSON.stringify(settings),
+  })
+}
+
+export async function enableMintMaker(
+  sessionToken: string,
+  password: string
+): Promise<{ success: boolean; message?: string }> {
+  return fetchJson(`${API_BASE}/mint-maker/enable`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    body: JSON.stringify({ password }),
+  })
+}
+
+export async function disableMintMaker(
+  sessionToken: string
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/mint-maker/disable`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+}
+
+export async function getMintMakerPairs(
+  sessionToken: string
+): Promise<{ pairs: import('../types').MintMakerPairSummary[] }> {
+  return fetchJson(`${API_BASE}/mint-maker/pairs`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+}
+
+export async function getMintMakerStats(
+  sessionToken: string
+): Promise<{ stats: import('../types').MintMakerStatsSnapshot }> {
+  return fetchJson(`${API_BASE}/mint-maker/stats`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+}
+
+export async function placeMintMakerPair(
+  sessionToken: string,
+  request: {
+    market_id: string
+    condition_id: string
+    question: string
+    asset: string
+    yes_token_id: string
+    no_token_id: string
+    yes_price: string
+    no_price: string
+    size: string
+    password: string
+    slug?: string
+  }
+): Promise<{
+  success: boolean
+  pair_id?: number
+  yes_order_id?: string
+  no_order_id?: string
+  yes_shares?: string
+  no_shares?: string
+  pair_cost?: string
+  expected_profit?: string
+}> {
+  return fetchJson(`${API_BASE}/mint-maker/place`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    body: JSON.stringify(request),
+  })
+}
+
+export async function getMintMakerLog(
+  sessionToken: string,
+  limit = 20
+): Promise<{ log: import('../types').MintMakerLogEntry[] }> {
+  return fetchJson(`${API_BASE}/mint-maker/log?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+}
+
+export async function cancelMintMakerPair(
+  sessionToken: string,
+  pairId: number
+): Promise<{ success: boolean }> {
+  return fetchJson(`${API_BASE}/mint-maker/cancel-pair`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    body: JSON.stringify({ pair_id: pairId }),
   })
 }
 

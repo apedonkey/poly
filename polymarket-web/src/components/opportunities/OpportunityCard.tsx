@@ -1,17 +1,68 @@
-import { useState, memo } from 'react'
-import { Clock, TrendingUp, Droplets, ExternalLink, Target, Crosshair, ChevronDown, ChevronUp, FileText } from 'lucide-react'
-import type { Opportunity } from '../../types'
+import { useState, useEffect, memo } from 'react'
+import { Clock, TrendingUp, Droplets, ExternalLink, Crosshair, ChevronDown, ChevronUp, FileText, ShoppingCart, Users } from 'lucide-react'
+import type { Opportunity, MarketHolder } from '../../types'
 import { TradeModal } from '../trading/TradeModal'
+import { useOrderStore } from '../../stores/orderStore'
+
+function formatHolderAmount(amount: number): string {
+  if (amount >= 1_000_000) return `$${(amount / 1_000_000).toFixed(1)}M`
+  if (amount >= 1_000) return `$${(amount / 1_000).toFixed(1)}K`
+  return `$${amount.toFixed(0)}`
+}
+
+function HolderRow({ rank, holder }: { rank: number; holder: MarketHolder }) {
+  return (
+    <div className="flex items-center justify-between text-xs py-0.5">
+      <div className="flex items-center gap-1 min-w-0">
+        <span className="text-gray-600 w-3 flex-shrink-0">{rank}.</span>
+        <span className="text-gray-300 truncate" title={holder.address}>{holder.name}</span>
+      </div>
+      <span className="text-gray-400 flex-shrink-0 ml-1 font-mono">{formatHolderAmount(holder.amount)}</span>
+    </div>
+  )
+}
 
 interface Props {
   opportunity: Opportunity
+  isPinned?: boolean
+  onPin?: () => void
 }
 
-export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Props) {
+export const OpportunityCard = memo(function OpportunityCard({ opportunity, isPinned, onPin }: Props) {
   const [tradeModalOpen, setTradeModalOpen] = useState(false)
   const [rulesExpanded, setRulesExpanded] = useState(false)
+  const [holdersExpanded, setHoldersExpanded] = useState(false)
+  const hasPendingOrder = useOrderStore((s) => s.hasPendingOrder(opportunity.market_id))
 
-  const pricePercent = (parseFloat(opportunity.entry_price) * 100).toFixed(0)
+  // Live price from WebSocket event (immediate, not debounced)
+  const [livePrice, setLivePrice] = useState<string | null>(null)
+  const [priceFlash, setPriceFlash] = useState<'up' | 'down' | null>(null)
+
+  useEffect(() => {
+    if (!opportunity.token_id) return
+
+    const handlePriceUpdate = (event: CustomEvent<{ token_id: string; price: string }>) => {
+      const { token_id, price } = event.detail
+      if (token_id === opportunity.token_id) {
+        setLivePrice((prev) => {
+          if (prev !== null) {
+            const prevNum = parseFloat(prev)
+            const currNum = parseFloat(price)
+            if (currNum > prevNum) setPriceFlash('up')
+            else if (currNum < prevNum) setPriceFlash('down')
+            setTimeout(() => setPriceFlash(null), 500)
+          }
+          return price
+        })
+      }
+    }
+
+    window.addEventListener('price-update', handlePriceUpdate as EventListener)
+    return () => window.removeEventListener('price-update', handlePriceUpdate as EventListener)
+  }, [opportunity.token_id])
+
+  const currentPrice = livePrice ?? opportunity.entry_price
+  const pricePercent = (parseFloat(currentPrice) * 100).toFixed(0)
   const edgePercent = (opportunity.edge * 100).toFixed(1)
   const returnPercent = (opportunity.expected_return * 100).toFixed(1)
 
@@ -30,27 +81,39 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Pr
     return `$${num.toFixed(0)}`
   }
 
-  const isSniper = opportunity.strategy === 'ResolutionSniper'
-
   return (
     <>
-      <div className="bg-poly-card rounded-xl border border-poly-border hover:border-poly-green/50 active:border-poly-green/50 transition p-3 sm:p-4">
+      <div
+        data-opportunity-card
+        onClick={(e) => {
+          // Only pin when clicking the card body, not interactive elements
+          if ((e.target as HTMLElement).closest('button, a')) return
+          onPin?.()
+        }}
+        className={`bg-poly-card rounded-xl border transition p-3 sm:p-4 ${
+          isPinned
+            ? 'border-poly-green shadow-[0_0_10px_rgba(0,255,102,0.15)]'
+            : 'border-poly-border hover:border-poly-green/50 active:border-poly-green/50'
+        } ${opportunity.meets_criteria === false ? 'opacity-60' : ''}`}>
         {/* Header with strategy badge and question */}
         <div className="flex items-start justify-between gap-2 sm:gap-3 mb-3">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5 sm:gap-2 mb-1 flex-wrap">
-              {isSniper ? (
-                <Crosshair className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-yellow-400 flex-shrink-0" />
-              ) : (
-                <Target className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-blue-400 flex-shrink-0" />
-              )}
-              <span className={`text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded ${
-                isSniper
-                  ? 'bg-yellow-500/20 text-yellow-400'
-                  : 'bg-blue-500/20 text-blue-400'
-              }`}>
-                {isSniper ? 'Sniper' : 'NO Bias'}
+              <Crosshair className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-yellow-400 flex-shrink-0" />
+              <span className="text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+                Sniper
               </span>
+              {opportunity.meets_criteria === false && (
+                <span className="text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+                  Paused
+                </span>
+              )}
+              {hasPendingOrder && (
+                <span className="text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded bg-orange-500/20 text-orange-400 flex items-center gap-1">
+                  <ShoppingCart className="w-3 h-3" />
+                  Order Pending
+                </span>
+              )}
               {opportunity.category && (
                 <span className="text-xs text-gray-500 truncate">{opportunity.category}</span>
               )}
@@ -83,7 +146,9 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Pr
             }`}>
               {opportunity.side}
             </div>
-            <div className="text-xs text-gray-500">{pricePercent}c</div>
+            <div className={`text-xs transition-colors duration-500 ${
+              priceFlash === 'up' ? 'text-green-400' : priceFlash === 'down' ? 'text-red-400' : 'text-gray-500'
+            }`}>{pricePercent}c</div>
           </div>
           <div className="text-center p-2 sm:p-0 bg-poly-dark/30 sm:bg-transparent rounded-lg">
             <div className="text-base sm:text-lg font-bold text-poly-green">+{edgePercent}%</div>
@@ -140,6 +205,60 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Pr
           </div>
         )}
 
+        {/* Top Holders - Collapsible */}
+        {opportunity.holders && (opportunity.holders.yes_holders.length > 0 || opportunity.holders.no_holders.length > 0) && (
+          <div className="mb-3">
+            <button
+              onClick={() => setHoldersExpanded(!holdersExpanded)}
+              className="w-full flex items-center justify-between text-xs text-gray-400 hover:text-gray-300 transition px-1 py-1"
+            >
+              <div className="flex items-center gap-1">
+                <Users className="w-3 h-3" />
+                <span>Top Holders</span>
+              </div>
+              {holdersExpanded ? (
+                <ChevronUp className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5" />
+              )}
+            </button>
+            {holdersExpanded && (
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                {/* YES Side */}
+                <div>
+                  <div className="text-xs font-medium text-poly-green mb-1.5">YES Side</div>
+                  {opportunity.holders.yes_holders.map((holder, i) => (
+                    <HolderRow key={i} rank={i + 1} holder={holder} />
+                  ))}
+                  {opportunity.holders.yes_total_count > 5 && (
+                    <div className="text-xs text-gray-500 mt-1 pl-4">
+                      +{opportunity.holders.yes_total_count - 5} more
+                    </div>
+                  )}
+                  {opportunity.holders.yes_holders.length === 0 && (
+                    <div className="text-xs text-gray-600 italic">No holders</div>
+                  )}
+                </div>
+                {/* NO Side */}
+                <div>
+                  <div className="text-xs font-medium text-poly-red mb-1.5">NO Side</div>
+                  {opportunity.holders.no_holders.map((holder, i) => (
+                    <HolderRow key={i} rank={i + 1} holder={holder} />
+                  ))}
+                  {opportunity.holders.no_total_count > 5 && (
+                    <div className="text-xs text-gray-500 mt-1 pl-4">
+                      +{opportunity.holders.no_total_count - 5} more
+                    </div>
+                  )}
+                  {opportunity.holders.no_holders.length === 0 && (
+                    <div className="text-xs text-gray-600 italic">No holders</div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Trade Button - Larger touch target on mobile */}
         <button
           onClick={() => setTradeModalOpen(true)}
@@ -164,6 +283,7 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Pr
   )
 }, (prev, next) => {
   // Custom comparison - only re-render if these fields change
+  if (prev.isPinned !== next.isPinned) return false
   const o1 = prev.opportunity
   const o2 = next.opportunity
   return (
@@ -174,6 +294,8 @@ export const OpportunityCard = memo(function OpportunityCard({ opportunity }: Pr
     o1.time_to_close_hours === o2.time_to_close_hours &&
     o1.side === o2.side &&
     o1.meets_criteria === o2.meets_criteria &&
-    o1.description === o2.description
+    o1.description === o2.description &&
+    (o1.holders?.yes_total_count ?? -1) === (o2.holders?.yes_total_count ?? -1) &&
+    (o1.holders?.no_total_count ?? -1) === (o2.holders?.no_total_count ?? -1)
   )
 })

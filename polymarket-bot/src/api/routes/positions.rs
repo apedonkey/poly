@@ -621,7 +621,7 @@ pub async fn close_position(
         // Full sell (legacy behavior) - close all remaining shares
         let pnl = state
             .db
-            .close_position_for_wallet(&session.wallet_address, position_id, exit_price)
+            .close_position_for_wallet(&session.wallet_address, position_id, exit_price, None)
             .await
             .map_err(|e| {
                 (

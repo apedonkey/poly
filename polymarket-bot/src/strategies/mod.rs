@@ -1,9 +1,9 @@
 //! Trading strategies for Polymarket
 
-pub mod no_bias;
+pub mod mint_maker;
 pub mod sniper;
 
-pub use no_bias::NoBiasStrategy;
+pub use mint_maker::MintMakerStrategy;
 pub use sniper::SniperStrategy;
 
 use crate::config::Config;
@@ -21,14 +21,14 @@ pub trait Strategy {
 /// Combined strategy runner
 pub struct StrategyRunner {
     pub sniper: SniperStrategy,
-    pub no_bias: NoBiasStrategy,
+    pub mint_maker: MintMakerStrategy,
 }
 
 impl StrategyRunner {
     pub fn new(config: &Config) -> Self {
         Self {
             sniper: SniperStrategy::new(config.sniper.clone()),
-            no_bias: NoBiasStrategy::new(config.no_bias.clone()),
+            mint_maker: MintMakerStrategy::new(config.mint_maker.clone()),
         }
     }
 
@@ -36,7 +36,6 @@ impl StrategyRunner {
     pub fn find_all_opportunities(&self, markets: &[TrackedMarket]) -> AllOpportunities {
         AllOpportunities {
             sniper: self.sniper.find_opportunities(markets),
-            no_bias: self.no_bias.find_opportunities(markets),
         }
     }
 }
@@ -44,15 +43,14 @@ impl StrategyRunner {
 /// Collection of opportunities from all strategies
 pub struct AllOpportunities {
     pub sniper: Vec<Opportunity>,
-    pub no_bias: Vec<Opportunity>,
 }
 
 impl AllOpportunities {
     pub fn total_count(&self) -> usize {
-        self.sniper.len() + self.no_bias.len()
+        self.sniper.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sniper.is_empty() && self.no_bias.is_empty()
+        self.sniper.is_empty()
     }
 }

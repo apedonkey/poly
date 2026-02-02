@@ -1,8 +1,8 @@
 //! WebSocket connection handler
 
 use crate::api::server::AppState;
-use crate::services::PriceUpdate;
-use crate::types::{ClarificationAlert, DisputeAlert, Opportunity};
+use crate::services::{McStatusUpdate, MintMakerStatusUpdate, OrderEvent, PriceUpdate};
+use crate::types::{DisputeAlert, Opportunity};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,6 +13,13 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
+
+/// Wallet balance update
+#[derive(Debug, Clone, Serialize)]
+pub struct WalletBalanceUpdate {
+    pub address: String,
+    pub usdc_balance: String,
+}
 
 /// WebSocket message from server to client
 #[derive(Debug, Serialize)]
@@ -35,12 +42,21 @@ pub enum WsServerMessage {
         scan_interval_seconds: u64,
         last_scan_at: i64,  // Unix timestamp ms
     },
-    /// Market clarification/description change alerts
-    #[serde(rename = "clarifications")]
-    Clarifications(Vec<ClarificationAlert>),
     /// UMA dispute alerts
     #[serde(rename = "disputes")]
     Disputes(Vec<DisputeAlert>),
+    /// Wallet balance update
+    #[serde(rename = "wallet_balance")]
+    WalletBalance(WalletBalanceUpdate),
+    /// Order event from user channel WebSocket
+    #[serde(rename = "order_event")]
+    OrderEvent(OrderEvent),
+    /// Millionaires Club status update
+    #[serde(rename = "mc_status")]
+    McStatus(McStatusUpdate),
+    /// Mint Maker status update
+    #[serde(rename = "mint_maker_status")]
+    MintMakerStatus(MintMakerStatusUpdate),
 }
 
 /// WebSocket message from client to server
@@ -99,16 +115,55 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // Send current disputes immediately
+    {
+        let disputes = state.disputes.read().await;
+        if !disputes.is_empty() {
+            let msg = WsServerMessage::Disputes(disputes.clone());
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(Message::Text(json)).await;
+            }
+        }
+    }
+
+    // Send cached MC status immediately
+    {
+        let mc_status = state.mc_status.read().await;
+        if let Some(ref status) = *mc_status {
+            let msg = WsServerMessage::McStatus(status.clone());
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(Message::Text(json)).await;
+            }
+        }
+    }
+
+    // Send cached Mint Maker status immediately
+    {
+        let mm_status = state.mint_maker_status.read().await;
+        if let Some(ref status) = *mm_status {
+            let msg = WsServerMessage::MintMakerStatus(status.clone());
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(Message::Text(json)).await;
+            }
+        }
+    }
+
     // Subscribe to opportunity updates
     let mut opportunity_rx = state.subscribe();
     // Subscribe to price updates
     let mut price_rx = state.subscribe_prices();
     // Subscribe to scan status updates
     let mut scan_status_rx = state.subscribe_scan_status();
-    // Subscribe to clarification alerts
-    let mut clarification_rx = state.subscribe_clarifications();
     // Subscribe to dispute alerts
     let mut dispute_rx = state.subscribe_disputes();
+    // Subscribe to wallet balance updates
+    let mut balance_rx = state.subscribe_balances();
+    // Subscribe to order events
+    let mut order_event_rx = state.subscribe_order_events();
+    // Subscribe to MC status updates
+    let mut mc_rx = state.subscribe_mc();
+    // Subscribe to Mint Maker status updates
+    let mut mint_maker_rx = state.subscribe_mint_maker();
 
     // Spawn task to forward opportunity, price, and scan status updates to this client
     let send_task = tokio::spawn(async move {
@@ -185,28 +240,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
 
-                // Handle clarification alert broadcasts
-                result = clarification_rx.recv() => {
-                    match result {
-                        Ok(alerts) => {
-                            let msg = WsServerMessage::Clarifications(alerts);
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                if sender.send(Message::Text(json)).await.is_err() {
-                                    debug!("WebSocket send failed, client disconnected");
-                                    break;
-                                }
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            debug!("Clarification updates lagged by {} messages", n);
-                        }
-                        Err(e) => {
-                            error!("Clarification broadcast receive error: {}", e);
-                            break;
-                        }
-                    }
-                }
-
                 // Handle dispute alert broadcasts
                 result = dispute_rx.recv() => {
                     match result {
@@ -224,6 +257,94 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                         Err(e) => {
                             error!("Dispute broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle wallet balance broadcasts
+                result = balance_rx.recv() => {
+                    match result {
+                        Ok(balance) => {
+                            let msg = WsServerMessage::WalletBalance(balance);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Wallet balance updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Wallet balance broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle order event broadcasts from user channel WebSocket
+                result = order_event_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            let msg = WsServerMessage::OrderEvent(event);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Order events lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Order event broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle MC status broadcasts
+                result = mc_rx.recv() => {
+                    match result {
+                        Ok(status) => {
+                            let msg = WsServerMessage::McStatus(status);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("MC status updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("MC status broadcast receive error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle Mint Maker status broadcasts
+                result = mint_maker_rx.recv() => {
+                    match result {
+                        Ok(status) => {
+                            let msg = WsServerMessage::MintMakerStatus(status);
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket send failed, client disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Mint Maker status updates lagged by {} messages", n);
+                        }
+                        Err(e) => {
+                            error!("Mint Maker status broadcast receive error: {}", e);
                             break;
                         }
                     }

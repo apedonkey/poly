@@ -39,13 +39,13 @@ export function AutoSellSettings({ settings, onUpdate, disabled, isPending }: Pr
         <button
           onClick={() => handleToggle('take_profit_enabled', !settings?.take_profit_enabled)}
           disabled={disabled || isPending}
-          className={`relative w-10 h-6 rounded-full transition-colors ${
+          className={`relative w-11 h-6 rounded-full transition-colors ${
             settings?.take_profit_enabled ? 'bg-poly-green' : 'bg-gray-600'
           }`}
         >
           <span
-            className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-              settings?.take_profit_enabled ? 'translate-x-4' : 'translate-x-0.5'
+            className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+              settings?.take_profit_enabled ? 'translate-x-5' : 'translate-x-0'
             }`}
           />
         </button>
@@ -63,13 +63,13 @@ export function AutoSellSettings({ settings, onUpdate, disabled, isPending }: Pr
         <button
           onClick={() => handleToggle('stop_loss_enabled', !settings?.stop_loss_enabled)}
           disabled={disabled || isPending}
-          className={`relative w-10 h-6 rounded-full transition-colors ${
+          className={`relative w-11 h-6 rounded-full transition-colors ${
             settings?.stop_loss_enabled ? 'bg-poly-green' : 'bg-gray-600'
           }`}
         >
           <span
-            className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-              settings?.stop_loss_enabled ? 'translate-x-4' : 'translate-x-0.5'
+            className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+              settings?.stop_loss_enabled ? 'translate-x-5' : 'translate-x-0'
             }`}
           />
         </button>
@@ -87,13 +87,13 @@ export function AutoSellSettings({ settings, onUpdate, disabled, isPending }: Pr
         <button
           onClick={() => handleToggle('trailing_stop_enabled', !settings?.trailing_stop_enabled)}
           disabled={disabled || isPending}
-          className={`relative w-10 h-6 rounded-full transition-colors ${
+          className={`relative w-11 h-6 rounded-full transition-colors ${
             settings?.trailing_stop_enabled ? 'bg-poly-green' : 'bg-gray-600'
           }`}
         >
           <span
-            className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-              settings?.trailing_stop_enabled ? 'translate-x-4' : 'translate-x-0.5'
+            className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+              settings?.trailing_stop_enabled ? 'translate-x-5' : 'translate-x-0'
             }`}
           />
         </button>
@@ -109,13 +109,13 @@ export function AutoSellSettings({ settings, onUpdate, disabled, isPending }: Pr
         <button
           onClick={() => handleToggle('time_exit_enabled', !settings?.time_exit_enabled)}
           disabled={disabled || isPending}
-          className={`relative w-10 h-6 rounded-full transition-colors ${
+          className={`relative w-11 h-6 rounded-full transition-colors ${
             settings?.time_exit_enabled ? 'bg-poly-green' : 'bg-gray-600'
           }`}
         >
           <span
-            className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-              settings?.time_exit_enabled ? 'translate-x-4' : 'translate-x-0.5'
+            className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+              settings?.time_exit_enabled ? 'translate-x-5' : 'translate-x-0'
             }`}
           />
         </button>

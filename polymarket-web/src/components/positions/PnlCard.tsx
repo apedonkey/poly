@@ -99,7 +99,7 @@ export function PnlCard({ position, isOpen, onClose }: Props) {
                     Trade Result
                   </div>
                   <div style={{ color: '#fff', fontSize: '14px', fontWeight: '600' }}>
-                    {position.strategy === 'ResolutionSniper' ? 'Sniper' : 'NO Bias'} Strategy
+                    {position.strategy === 'ResolutionSniper' ? 'Sniper' : position.strategy === 'Dispute' ? 'Dispute' : 'MC'} Strategy
                   </div>
                 </div>
               </div>

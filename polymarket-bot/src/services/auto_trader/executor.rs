@@ -7,7 +7,6 @@ use crate::types::Opportunity;
 use crate::wallet::decrypt_private_key;
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::info;
 

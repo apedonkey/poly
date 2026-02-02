@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { Opportunity } from '../types'
 
-export type FilterType = 'all' | 'sniper' | 'nobias' | 'crypto' | 'sports'
+export type FilterType = 'all' | 'sniper' | 'crypto' | 'sports'
 export type SortType = 'time' | 'edge' | 'return' | 'liquidity'
 export type SideFilter = 'all' | 'no' | 'yes'
 
@@ -120,6 +120,7 @@ interface OpportunityState {
   scanReceivedAt: number | null  // Local timestamp when we received scan_status
   scanElapsedAtReceive: number   // How many seconds had elapsed when we received scan_status
   scanIntervalSeconds: number    // Scan interval from backend
+  scanVersion: number            // Increments on full scan, not on price updates
   setOpportunities: (opportunities: Opportunity[]) => void
   setScanStatus: (lastScanAt: number, intervalSeconds: number) => void
   setFilter: (filter: FilterType) => void
@@ -140,8 +141,9 @@ export const useOpportunityStore = create<OpportunityState>()(
       sideFilter: 'all',
       scanReceivedAt: null,
       scanElapsedAtReceive: 0,
-      scanIntervalSeconds: 60,
-      setOpportunities: (opportunities) => set({ opportunities }),
+      scanIntervalSeconds: 15,
+      scanVersion: 0,
+      setOpportunities: (opportunities) => set((state) => ({ opportunities, scanVersion: state.scanVersion + 1 })),
       setScanStatus: (lastScanAt, intervalSeconds) => {
         // Calculate how much time elapsed on the backend since the scan
         // We use this offset to avoid clock drift issues
@@ -213,9 +215,6 @@ export const useOpportunityStore = create<OpportunityState>()(
           o.time_to_close_hours <= 12
         )
         break
-      case 'nobias':
-        result = opportunities.filter((o) => o.strategy === 'NoBias')
-        break
       case 'crypto':
         result = opportunities.filter(isCrypto)
         break
@@ -240,7 +239,6 @@ export const useOpportunityStore = create<OpportunityState>()(
         o.time_to_close_hours !== null &&
         o.time_to_close_hours <= 12
       ).length,
-      nobias: opportunities.filter((o) => o.strategy === 'NoBias').length,
       crypto: opportunities.filter(isCrypto).length,
       sports: opportunities.filter(isSports).length,
     }

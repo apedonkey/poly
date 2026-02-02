@@ -94,12 +94,38 @@ export function SellModal({ isOpen, onClose, position, onSold }: Props) {
     }
   }, [isActivating, activationStatus, checkActivationStatus])
 
+  // Flash indicator for live price changes
+  const [priceFlash, setPriceFlash] = useState<'up' | 'down' | null>(null)
+
   // Fetch current market price and token balance when modal opens
   useEffect(() => {
     if (isOpen && position.token_id) {
       fetchCurrentPrice()
       fetchActualTokenBalance()
     }
+  }, [isOpen, position.token_id])
+
+  // Live price updates via WebSocket while modal is open
+  useEffect(() => {
+    if (!isOpen || !position.token_id) return
+
+    const handlePriceUpdate = (event: CustomEvent<{ token_id: string; price: string }>) => {
+      const { token_id, price } = event.detail
+      if (token_id === position.token_id) {
+        const newPrice = parseFloat(price)
+        setCurrentPrice((prev) => {
+          if (prev !== null) {
+            if (newPrice > prev) setPriceFlash('up')
+            else if (newPrice < prev) setPriceFlash('down')
+            setTimeout(() => setPriceFlash(null), 500)
+          }
+          return newPrice
+        })
+      }
+    }
+
+    window.addEventListener('price-update', handlePriceUpdate as EventListener)
+    return () => window.removeEventListener('price-update', handlePriceUpdate as EventListener)
   }, [isOpen, position.token_id])
 
   // Fetch actual token balance from the blockchain
@@ -495,6 +521,7 @@ export function SellModal({ isOpen, onClose, position, onSold }: Props) {
     setActualTokenBalance(null)
     setSellPercentage(100) // Reset to Max
     setSellResult(null)
+    setPriceFlash(null)
     entryPriceCorrected.current = false
     clearClobError()
     onClose()
@@ -599,7 +626,9 @@ export function SellModal({ isOpen, onClose, position, onSold }: Props) {
             {loadingPrice ? (
               <Loader2 className="w-4 h-4 animate-spin text-gray-400 mx-auto" />
             ) : currentPrice !== null ? (
-              <span className="text-lg sm:text-xl font-bold">{(currentPrice * 100).toFixed(0)}c</span>
+              <span className={`text-lg sm:text-xl font-bold transition-colors duration-500 ${
+                priceFlash === 'up' ? 'text-green-400' : priceFlash === 'down' ? 'text-red-400' : ''
+              }`}>{(currentPrice * 100).toFixed(0)}c</span>
             ) : (
               <span className="text-gray-500">N/A</span>
             )}

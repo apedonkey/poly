@@ -2,7 +2,7 @@
 name = "polymarket-bot"
 version = "0.1.0"
 edition = "2021"
-description = "Polymarket prediction market trading bot with Resolution Sniping and NO Bias strategies"
+description = "Polymarket prediction market trading bot with Resolution Sniping strategy"
 authors = ["Trading Bot"]
 
 [dependencies]
@@ -52,7 +52,7 @@ colored = "2.0"
 polymarket-client-sdk = { version = "0.4", features = ["clob", "gamma"] }
 
 # Alloy for Ethereum signing (required by polymarket-client-sdk)
-alloy = { version = "1.4", default-features = false, features = ["signer-local", "signers"] }
+alloy = { version = "1.4", default-features = false, features = ["signer-local", "signers", "sol-types"] }
 
 # Web server
 axum = { version = "0.7", features = ["ws", "macros"] }
@@ -78,6 +78,9 @@ hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+
+# URL encoding
+urlencoding = "2.1"
 
 [[bin]]
 name = "polymarket-bot"

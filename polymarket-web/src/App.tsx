@@ -1,25 +1,23 @@
 import { useState } from 'react'
-import { TrendingUp, LayoutDashboard, Briefcase, Zap, FileText, AlertTriangle } from 'lucide-react'
+import { TrendingUp, LayoutDashboard, Briefcase, Zap, AlertTriangle, Coins } from 'lucide-react'
 import { WalletConnect } from './components/wallet/WalletConnect'
 import { OpportunityList } from './components/opportunities/OpportunityList'
 import { PositionList } from './components/positions/PositionList'
 import { AutoTradingPanel } from './components/auto-trading/AutoTradingPanel'
-import { ClarificationsPanel } from './components/clarifications/ClarificationsPanel'
 import { DisputesPanel } from './components/disputes/DisputesPanel'
+import { MintMakerPanel } from './components/mint-maker/MintMakerPanel'
 import { FAQ } from './components/FAQ'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDiscordAlerts } from './hooks/useDiscordAlerts'
 import { useOpportunityStore } from './stores/opportunityStore'
-import { useClarificationStore } from './stores/clarificationStore'
 import { useDisputeStore } from './stores/disputeStore'
 
-type Tab = 'opportunities' | 'positions' | 'auto-trade' | 'clarifications' | 'disputes'
+type Tab = 'opportunities' | 'positions' | 'auto-trade' | 'disputes' | 'mint-maker'
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('opportunities')
   // Only subscribe to the count, not the entire array - prevents re-renders on every update
   const opportunityCount = useOpportunityStore((s) => s.opportunities.length)
-  const clarificationCount = useClarificationStore((s) => s.clarifications.length)
   const disputeCount = useDisputeStore((s) => s.disputes.length)
 
   // Connect to WebSocket for real-time updates
@@ -87,23 +85,6 @@ function App() {
               <span className="text-sm sm:text-base">Auto-Trade</span>
             </button>
             <button
-              onClick={() => setActiveTab('clarifications')}
-              className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-3 border-b-2 transition flex-1 sm:flex-none touch-target ${
-                activeTab === 'clarifications'
-                  ? 'border-amber-400 text-amber-400'
-                  : 'border-transparent text-gray-400 hover:text-white active:text-white'
-              }`}
-            >
-              <FileText className="w-4 h-4" />
-              <span className="text-sm sm:text-base hidden sm:inline">Clarifications</span>
-              <span className="text-sm sm:hidden">Clarify</span>
-              {clarificationCount > 0 && (
-                <span className="text-xs bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded-full">
-                  {clarificationCount}
-                </span>
-              )}
-            </button>
-            <button
               onClick={() => setActiveTab('disputes')}
               className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-3 border-b-2 transition flex-1 sm:flex-none touch-target ${
                 activeTab === 'disputes'
@@ -119,6 +100,17 @@ function App() {
                 </span>
               )}
             </button>
+            <button
+              onClick={() => setActiveTab('mint-maker')}
+              className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-3 border-b-2 transition flex-1 sm:flex-none touch-target ${
+                activeTab === 'mint-maker'
+                  ? 'border-yellow-400 text-yellow-400'
+                  : 'border-transparent text-gray-400 hover:text-white active:text-white'
+              }`}
+            >
+              <Coins className="w-4 h-4" />
+              <span className="text-sm sm:text-base">Mint Maker</span>
+            </button>
           </div>
         </div>
       </nav>
@@ -129,8 +121,8 @@ function App() {
         {activeTab === 'opportunities' && <OpportunityList />}
         {activeTab === 'positions' && <PositionList />}
         {activeTab === 'auto-trade' && <AutoTradingPanel />}
-        {activeTab === 'clarifications' && <ClarificationsPanel />}
         {activeTab === 'disputes' && <DisputesPanel />}
+        {activeTab === 'mint-maker' && <MintMakerPanel />}
       </main>
 
       {/* Footer */}

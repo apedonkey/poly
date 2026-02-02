@@ -39,7 +39,7 @@ pub struct SettingsResponse {
 pub struct AutoTradingSettingsDto {
     pub enabled: bool,
     pub auto_buy_enabled: bool,
-    pub max_position_size: String,
+    pub position_size: String,
     pub max_total_exposure: String,
     pub min_edge: f64,
     pub strategies: Vec<String>,
@@ -54,6 +54,10 @@ pub struct AutoTradingSettingsDto {
     pub max_positions: i32,
     pub cooldown_minutes: i32,
     pub max_daily_loss: String,
+    pub dispute_sniper_enabled: bool,
+    pub min_dispute_edge: f64,
+    pub dispute_position_size: String,
+    pub dispute_exit_on_escalation: bool,
 }
 
 impl From<AutoTradingSettings> for AutoTradingSettingsDto {
@@ -61,7 +65,7 @@ impl From<AutoTradingSettings> for AutoTradingSettingsDto {
         Self {
             enabled: s.enabled,
             auto_buy_enabled: s.auto_buy_enabled,
-            max_position_size: s.max_position_size.to_string(),
+            position_size: s.position_size.to_string(),
             max_total_exposure: s.max_total_exposure.to_string(),
             min_edge: s.min_edge,
             strategies: s.strategies,
@@ -76,6 +80,10 @@ impl From<AutoTradingSettings> for AutoTradingSettingsDto {
             max_positions: s.max_positions,
             cooldown_minutes: s.cooldown_minutes,
             max_daily_loss: s.max_daily_loss.to_string(),
+            dispute_sniper_enabled: s.dispute_sniper_enabled,
+            min_dispute_edge: s.min_dispute_edge,
+            dispute_position_size: s.dispute_position_size.to_string(),
+            dispute_exit_on_escalation: s.dispute_exit_on_escalation,
         }
     }
 }
@@ -272,8 +280,8 @@ pub async fn update_settings(
     if let Some(auto_buy_enabled) = req.auto_buy_enabled {
         settings.auto_buy_enabled = auto_buy_enabled;
     }
-    if let Some(max_position_size) = req.max_position_size {
-        settings.max_position_size = Decimal::from_str(&max_position_size).unwrap_or(settings.max_position_size);
+    if let Some(position_size) = req.position_size {
+        settings.position_size = Decimal::from_str(&position_size).unwrap_or(settings.position_size);
     }
     if let Some(max_total_exposure) = req.max_total_exposure {
         settings.max_total_exposure = Decimal::from_str(&max_total_exposure).unwrap_or(settings.max_total_exposure);
@@ -316,6 +324,18 @@ pub async fn update_settings(
     }
     if let Some(max_daily_loss) = req.max_daily_loss {
         settings.max_daily_loss = Decimal::from_str(&max_daily_loss).unwrap_or(settings.max_daily_loss);
+    }
+    if let Some(dispute_sniper_enabled) = req.dispute_sniper_enabled {
+        settings.dispute_sniper_enabled = dispute_sniper_enabled;
+    }
+    if let Some(min_dispute_edge) = req.min_dispute_edge {
+        settings.min_dispute_edge = min_dispute_edge;
+    }
+    if let Some(dispute_position_size) = req.dispute_position_size {
+        settings.dispute_position_size = Decimal::from_str(&dispute_position_size).unwrap_or(settings.dispute_position_size);
+    }
+    if let Some(dispute_exit_on_escalation) = req.dispute_exit_on_escalation {
+        settings.dispute_exit_on_escalation = dispute_exit_on_escalation;
     }
 
     // Save updated settings
@@ -579,6 +599,7 @@ pub struct StatusResponse {
     pub open_positions: i32,
     pub total_exposure: String,
     pub daily_pnl: String,
+    pub wallet_balance: String,
 }
 
 /// Get current auto-trading status
@@ -638,11 +659,70 @@ pub async fn get_status(
         .await
         .unwrap_or_default();
 
+    // Fetch on-chain USDC balance
+    let wallet_balance = fetch_usdc_balance_rpc(
+        &state.config.polygon_rpc_url,
+        &session.wallet_address,
+    )
+    .await
+    .unwrap_or_else(|_| "0.00".to_string());
+
     Ok(Json(StatusResponse {
         enabled: settings.enabled,
         auto_buy_enabled: settings.auto_buy_enabled,
         open_positions,
         total_exposure: total_exposure.to_string(),
         daily_pnl: daily_pnl.to_string(),
+        wallet_balance,
     }))
+}
+
+// USDC.e (bridged) contract address on Polygon
+const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+/// JSON-RPC response
+#[derive(Debug, serde::Deserialize)]
+struct JsonRpcResponse {
+    result: Option<String>,
+}
+
+/// Fetch USDC balance from Polygon RPC
+async fn fetch_usdc_balance_rpc(rpc_url: &str, address: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let padded_address = format!(
+        "000000000000000000000000{}",
+        address.trim_start_matches("0x")
+    );
+    let data = format!("0x70a08231{}", padded_address);
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [
+            {
+                "to": USDC_ADDRESS,
+                "data": data
+            },
+            "latest"
+        ],
+        "id": 1
+    });
+
+    let client = reqwest::Client::new();
+    let response: JsonRpcResponse = client
+        .post(rpc_url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if let Some(hex_balance) = response.result {
+        let balance = u128::from_str_radix(hex_balance.trim_start_matches("0x"), 16).unwrap_or(0);
+        // USDC has 6 decimals
+        let whole = balance / 1_000_000;
+        let fraction = (balance % 1_000_000) * 100 / 1_000_000;
+        Ok(format!("{}.{:02}", whole, fraction))
+    } else {
+        Ok("0.00".to_string())
+    }
 }

@@ -9,6 +9,7 @@ export function DisputesPanel() {
   const proposedCount = disputes.filter((d) => d.dispute_status === 'Proposed').length
   const disputedCount = disputes.filter((d) => d.dispute_status === 'Disputed').length
   const dvmCount = disputes.filter((d) => d.dispute_status === 'DvmVote').length
+  const round2Count = disputes.filter((d) => (d.dispute_round || 1) >= 2).length
 
   return (
     <div className="space-y-4">
@@ -38,6 +39,11 @@ export function DisputesPanel() {
                 {dvmCount} DVM voting
               </span>
             )}
+            {round2Count > 0 && (
+              <span className="bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded">
+                {round2Count} round 2
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -49,10 +55,12 @@ export function DisputesPanel() {
           <div className="text-sm text-gray-300">
             <p className="font-medium text-red-400 mb-1">What are UMA Disputes?</p>
             <p className="text-gray-400">
-              Polymarket uses the UMA Optimistic Oracle for resolution. When an outcome is
-              proposed, there's a 2-hour challenge window. If disputed, it escalates to UMA
-              DVM (Data Verification Mechanism) voting. Markets in dispute often have
-              mispriced assets as traders speculate on the final outcome.
+              Polymarket uses the UMA Optimistic Oracle (v1/v2/v3 adapters) for resolution.
+              When an outcome is proposed, there's a challenge window (typically 2 hours).
+              The UmaCtfAdapter uses a <strong>two-round mechanism</strong>: the first dispute
+              resets the proposal (round 2), and only a second dispute escalates to UMA DVM
+              voting. Bond is typically $750 USDC. Possible DVM outcomes: proposer wins,
+              challenger wins, too early, or 50-50 split.
             </p>
           </div>
         </div>
@@ -68,7 +76,7 @@ export function DisputesPanel() {
       ) : (
         <div className="grid gap-3">
           {disputes.map((alert) => (
-            <DisputeCard key={alert.market_id} alert={alert} />
+            <DisputeCard key={alert.assertion_id} alert={alert} />
           ))}
         </div>
       )}

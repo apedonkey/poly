@@ -1,0 +1,121 @@
+================================================================================
+             MILLIONAIRES CLUB — GO LIVE GUIDE
+================================================================================
+
+OVERVIEW
+--------
+The Millionaires Club (MC) scanner identifies markets priced 93–99.5 cents
+that are highly likely to resolve in the favorite's direction. It scores
+resolution certainty, checks orderbook depth, and simulates trades through
+a 7-tier bankroll progression system.
+
+This guide covers the requirements and steps to transition from observation
+mode to live trading.
+
+
+MINIMUM OBSERVATION REQUIREMENTS
+---------------------------------
+Before going live, verify ALL of the following:
+
+  1. At least 30 evaluated trades (simulated entries)
+  2. Win rate at least 2% above breakeven for your average entry price
+  3. Positive simulated P&L
+  4. No active pauses (drawdown, weekly loss)
+  5. At least 2 weeks of observation data
+
+
+BREAKEVEN THRESHOLDS BY ENTRY PRICE
+-------------------------------------
+Your win rate must exceed these thresholds to be profitable:
+
+  Entry Price    Breakeven Win Rate    Target (BE + 2%)
+  -----------    ------------------    -----------------
+  93c            93.0%                 95.0%
+  94c            94.0%                 96.0%
+  95c            95.0%                 97.0%
+  96c            96.0%                 98.0%
+  97c            97.0%                 99.0%
+  98c            98.0%                 100% (not viable)
+  99c            99.0%                 100% (not viable)
+
+  Rule of thumb: Only entries at 93–96c have realistic profit potential.
+  Entries at 97c+ require near-perfect resolution accuracy.
+
+
+TIER SYSTEM
+-----------
+  Tier    Bankroll    Bet Size    Promote At    Demote At    Max Positions
+  ----    --------    --------    ----------    ---------    -------------
+  1       $40         $5          $48           $32          6
+  2       $100        $12         $120          $80          7
+  3       $300        $35         $360          $240         8
+  4       $1,000      $100        $1,200        $800         9
+  5       $3,000      $250        $3,600        $2,400       10
+  6       $7,000      $500        $8,400        $5,600       11
+  7       $10,000     $750        $12,000       $8,000       12
+
+
+ACTIVATION STEPS
+-----------------
+1. Verify observation data meets all minimum requirements above
+2. Fund your wallet with at least the Tier 1 bankroll amount ($40)
+3. Ensure the dispute tracker is running (check Auto-Trade tab)
+4. Update the MC config to live mode:
+
+   curl -X PUT http://localhost:3000/api/mc/config \
+     -H "Content-Type: application/json" \
+     -d '{"mode": "live"}'
+
+5. Set your actual bankroll amount:
+
+   curl -X PUT http://localhost:3000/api/mc/config \
+     -H "Content-Type: application/json" \
+     -d '{"bankroll": "40"}'
+
+6. Monitor the Auto-Trade tab for MC activity
+
+
+RISK MANAGEMENT RULES
+-----------------------
+These rules are enforced automatically:
+
+  - 20% drawdown from peak: Position size halved
+  - 35% drawdown from peak: Trading paused for 48 hours
+  - 2 losses in 7 days: Trading paused for 48 hours
+  - Maximum positions per tier enforced (6–12)
+  - Maximum 2 positions per category
+  - Slippage must be < 0.5% at time of entry
+
+
+WHAT TO MONITOR AFTER ACTIVATION
+----------------------------------
+  - Win rate vs breakeven threshold for your average entry price
+  - Drawdown percentage (visible in MC dashboard)
+  - Scout log quality (are certainty scores correlating with outcomes?)
+  - Tier progression (are you advancing or getting demoted?)
+  - Category concentration (avoid overexposure to one category)
+  - Resolution timing (are markets resolving within expected timeframes?)
+
+
+EMERGENCY SHUTDOWN
+-------------------
+To immediately stop MC trading:
+
+  curl -X PUT http://localhost:3000/api/mc/config \
+    -H "Content-Type: application/json" \
+    -d '{"mode": "observation"}'
+
+This switches back to observation mode. Open positions will still be
+tracked for resolution but no new trades will be placed.
+
+
+TROUBLESHOOTING
+----------------
+  - "No markets evaluated": Scanner hasn't received market data yet.
+    Wait for next scan cycle (check scan progress bar).
+  - "Paused: drawdown": Bankroll dropped 35%+ from peak. Wait 48h
+    or manually reset bankroll via config update.
+  - "Paused: weekly loss": 2+ losses in 7 days. Wait 48h.
+  - Low certainty scores: Markets may lack mechanical resolution sources.
+    This is expected — the scanner is selective by design.
+================================================================================

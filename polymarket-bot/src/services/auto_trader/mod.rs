@@ -8,6 +8,7 @@
 pub mod auto_buyer;
 pub mod auto_seller;
 pub mod config;
+pub mod dispute_sniper;
 pub mod executor;
 pub mod key_store;
 pub mod position_monitor;
@@ -15,6 +16,7 @@ pub mod types;
 
 pub use auto_buyer::AutoBuyer;
 pub use auto_seller::AutoSeller;
+pub use dispute_sniper::DisputeSniper;
 pub use config::{AutoTradingSettings, UpdateSettingsRequest};
 pub use executor::AutoTradingExecutor;
 pub use key_store::KeyStore;

@@ -2,7 +2,7 @@
 //!
 //! Listens to new opportunities and executes buys when:
 //! - Auto-buy is enabled for the wallet
-//! - Opportunity matches configured strategies (sniper, no_bias)
+//! - Opportunity matches configured strategies (sniper)
 //! - Position limits and exposure limits are not exceeded
 //! - Minimum edge threshold is met
 
@@ -13,6 +13,7 @@ use crate::types::Opportunity;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -26,17 +27,34 @@ use polymarket_client_sdk::clob::types::{Amount, OrderType, Side as ClobSide};
 const POLYGON_CHAIN_ID: u64 = 137;
 const CLOB_ENDPOINT: &str = "https://clob.polymarket.com";
 
+/// USDC.e (bridged) contract address on Polygon - used by Polymarket
+const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+/// Minimum USDC balance to attempt a trade (covers gas overhead)
+const MIN_TRADE_BALANCE: &str = "1.00";
+
 /// Auto-Buyer service
 pub struct AutoBuyer {
     db: Arc<Database>,
     key_store: KeyStore,
     /// Shared list of current opportunities
+    #[allow(dead_code)]
     opportunities: Arc<RwLock<Vec<Opportunity>>>,
+    /// Polygon RPC URL for balance queries
+    polygon_rpc_url: String,
+    /// Slippage tolerance for market orders
+    slippage_tolerance: f64,
 }
 
 impl AutoBuyer {
-    pub fn new(db: Arc<Database>, key_store: KeyStore, opportunities: Arc<RwLock<Vec<Opportunity>>>) -> Self {
-        Self { db, key_store, opportunities }
+    pub fn new(
+        db: Arc<Database>,
+        key_store: KeyStore,
+        opportunities: Arc<RwLock<Vec<Opportunity>>>,
+        polygon_rpc_url: String,
+        slippage_tolerance: f64,
+    ) -> Self {
+        Self { db, key_store, opportunities, polygon_rpc_url, slippage_tolerance }
     }
 
     /// Run the auto-buyer, listening for opportunity updates
@@ -122,6 +140,26 @@ impl AutoBuyer {
             return Ok(());
         }
 
+        // Check actual on-chain USDC balance
+        let usdc_balance = self.fetch_usdc_balance(wallet_address).await.unwrap_or_else(|e| {
+            warn!("Failed to fetch USDC balance for {}: {}. Skipping balance check.", wallet_address, e);
+            Decimal::MAX // If we can't fetch, fall through to other limits
+        });
+
+        let min_balance = Decimal::from_str(MIN_TRADE_BALANCE).unwrap_or(Decimal::ONE);
+        if usdc_balance < min_balance {
+            debug!(
+                "Wallet {} has insufficient USDC balance (${} < ${})",
+                wallet_address, usdc_balance, min_balance
+            );
+            return Ok(());
+        }
+
+        info!(
+            "[Auto-Buy] Wallet {} USDC balance: ${}",
+            wallet_address, usdc_balance
+        );
+
         // Find matching opportunities
         for opp in opportunities {
             // Check if already has position in this market
@@ -132,7 +170,9 @@ impl AutoBuyer {
             // Check if strategy is enabled
             let strategy_enabled = match opp.strategy {
                 crate::types::StrategyType::ResolutionSniper => settings.strategies.contains(&"sniper".to_string()),
-                crate::types::StrategyType::NoBias => settings.strategies.contains(&"no_bias".to_string()),
+                crate::types::StrategyType::Dispute => false, // Handled by DisputeSniper
+                crate::types::StrategyType::MillionairesClub => false, // Handled by McScanner
+                crate::types::StrategyType::MintMaker => false, // Handled by MintMaker service
             };
 
             if !strategy_enabled {
@@ -149,11 +189,17 @@ impl AutoBuyer {
                 continue;
             }
 
-            // Calculate position size (respecting limits)
+            // Calculate position size (respecting limits AND wallet balance)
             let available_exposure = max_exposure - current_exposure;
-            let position_size = settings.max_position_size.min(available_exposure);
+            let position_size = settings.position_size
+                .min(available_exposure)
+                .min(usdc_balance);
 
-            if position_size <= Decimal::ZERO {
+            if position_size <= Decimal::ZERO || position_size < min_balance {
+                debug!(
+                    "Wallet {} position size too small: ${} (balance: ${}, exposure room: ${})",
+                    wallet_address, position_size, usdc_balance, available_exposure
+                );
                 continue;
             }
 
@@ -181,8 +227,8 @@ impl AutoBuyer {
                 opp.edge * 100.0
             );
 
-            // Execute live buy order
-            let order_id = match self.execute_buy(&private_key, &token_id, position_size).await {
+            // Execute live buy order with slippage protection
+            let order_id = match self.execute_buy(&private_key, &token_id, position_size, opp.entry_price, self.slippage_tolerance).await {
                 Ok(id) => Some(id),
                 Err(e) => {
                     warn!("[Auto-Buy] Failed to execute buy: {}", e);
@@ -206,6 +252,7 @@ impl AutoBuyer {
                     None,  // end_date
                     Some(&token_id),
                     order_id.as_deref(),
+                    opp.neg_risk,
                 )
                 .await?;
 
@@ -242,8 +289,56 @@ impl AutoBuyer {
         Ok(())
     }
 
-    /// Execute a buy order via CLOB API
-    async fn execute_buy(&self, private_key: &str, token_id: &str, size: Decimal) -> Result<String> {
+    /// Fetch on-chain USDC balance for a wallet address
+    async fn fetch_usdc_balance(&self, wallet_address: &str) -> Result<Decimal> {
+        // balanceOf(address) function selector: 0x70a08231
+        let padded_address = format!(
+            "000000000000000000000000{}",
+            wallet_address.trim_start_matches("0x")
+        );
+        let data = format!("0x70a08231{}", padded_address);
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": USDC_ADDRESS,
+                    "data": data
+                },
+                "latest"
+            ],
+            "id": 1
+        });
+
+        let client = reqwest::Client::new();
+        let response: JsonRpcResponse = client
+            .post(&self.polygon_rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send RPC request")?
+            .json()
+            .await
+            .context("Failed to parse RPC response")?;
+
+        let hex_balance = response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("No result in RPC response"))?;
+
+        let balance_raw = u128::from_str_radix(hex_balance.trim_start_matches("0x"), 16)
+            .unwrap_or(0);
+
+        // USDC has 6 decimals
+        let whole = balance_raw / 1_000_000;
+        let fraction = balance_raw % 1_000_000;
+        let balance_str = format!("{}.{:06}", whole, fraction);
+
+        Decimal::from_str(&balance_str).context("Failed to parse balance as Decimal")
+    }
+
+    /// Execute a buy order via CLOB API with slippage protection
+    async fn execute_buy(&self, private_key: &str, token_id: &str, size: Decimal, entry_price: Decimal, slippage: f64) -> Result<String> {
         // Create signer from private key
         let signer: PrivateKeySigner = private_key.parse()
             .context("Failed to parse private key")?;
@@ -262,12 +357,17 @@ impl AutoBuyer {
         let token_id_u256 = U256::from_str_radix(token_id, 10)
             .context("Failed to parse token ID")?;
 
-        // Create buy order
+        // Calculate worst-case price with slippage
+        let slippage_dec = Decimal::try_from(slippage).unwrap_or(Decimal::new(5, 3));
+        let worst_case_price = entry_price * (Decimal::ONE + slippage_dec);
+
+        // Create buy order with slippage protection
         let order = client
             .market_order()
             .token_id(token_id_u256)
             .amount(Amount::usdc(size).context("Failed to create USDC amount")?)
             .side(ClobSide::Buy)
+            .price(worst_case_price)
             .order_type(OrderType::FOK)
             .build()
             .await
@@ -289,4 +389,10 @@ impl AutoBuyer {
 
         Ok(order_id)
     }
+}
+
+/// JSON-RPC response for balance queries
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse {
+    result: Option<String>,
 }

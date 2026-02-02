@@ -117,7 +117,9 @@ impl SniperStrategy {
             description: market.description.clone(),
             recommendation,
             token_id,
+            neg_risk: market.neg_risk,
             meets_criteria: true,
+            holders: None,
         })
     }
 

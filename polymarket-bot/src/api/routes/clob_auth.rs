@@ -238,6 +238,14 @@ pub async fn derive_api_key(
 
     info!("API credentials stored for wallet {}", session.wallet_address);
 
+    // Spawn a User WebSocket for this wallet so they get real-time order events
+    state.spawn_user_ws(
+        session.wallet_address.clone(),
+        credentials.api_key.clone(),
+        credentials.secret.clone(),
+        credentials.passphrase.clone(),
+    ).await;
+
     Ok(Json(ApiCredentialsResponse {
         api_key: credentials.api_key,
         api_secret: credentials.secret,

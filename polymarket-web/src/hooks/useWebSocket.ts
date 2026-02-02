@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useOpportunityStore } from '../stores/opportunityStore'
-import { useClarificationStore } from '../stores/clarificationStore'
 import { useDisputeStore } from '../stores/disputeStore'
+import { useMintMakerStore } from '../stores/mintMakerStore'
 import type { WsMessage } from '../types'
 
 export function useWebSocket() {
@@ -12,8 +12,8 @@ export function useWebSocket() {
   const setOpportunities = useOpportunityStore((s) => s.setOpportunities)
   const setScanStatus = useOpportunityStore((s) => s.setScanStatus)
   const updatePrices = useOpportunityStore((s) => s.updatePrices)
-  const setClarifications = useClarificationStore((s) => s.setClarifications)
   const setDisputes = useDisputeStore((s) => s.setDisputes)
+  const setMintMakerStatus = useMintMakerStore((s) => s.setStatus)
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -72,13 +72,36 @@ export function useWebSocket() {
             // Update scan timing for progress bar
             setScanStatus(message.data.last_scan_at, message.data.scan_interval_seconds)
             break
-          case 'clarifications':
-            // Update clarification alerts
-            setClarifications(message.data)
-            break
           case 'disputes':
             // Update dispute alerts
             setDisputes(message.data)
+            break
+          case 'wallet_balance':
+            // Dispatch wallet balance event for any listening component
+            window.dispatchEvent(
+              new CustomEvent('wallet-balance', {
+                detail: { address: message.data.address, usdc_balance: message.data.usdc_balance },
+              })
+            )
+            break
+          case 'order_event':
+            // Dispatch order event for order tracking components
+            window.dispatchEvent(
+              new CustomEvent('order-event', {
+                detail: message.data,
+              })
+            )
+            break
+          case 'mc_status':
+            // Dispatch MC status event for Millionaires Club component
+            window.dispatchEvent(
+              new CustomEvent('mc-status', {
+                detail: message.data,
+              })
+            )
+            break
+          case 'mint_maker_status':
+            setMintMakerStatus(message.data)
             break
           case 'error':
             console.error('WebSocket error:', message.data.message)
@@ -99,7 +122,7 @@ export function useWebSocket() {
     ws.onerror = (error) => {
       console.error('WebSocket error:', error)
     }
-  }, [setOpportunities, setScanStatus, updatePrices, setClarifications, setDisputes])
+  }, [setOpportunities, setScanStatus, updatePrices, setDisputes, setMintMakerStatus])
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {

@@ -7,3 +7,4 @@ pub mod server;
 pub mod ws;
 
 pub use server::{create_app, AppState, ScanStatus};
+pub use ws::WalletBalanceUpdate;

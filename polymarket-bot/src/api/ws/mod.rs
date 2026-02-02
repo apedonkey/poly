@@ -1,5 +1,5 @@
 //! WebSocket handlers for real-time updates
 
-mod handler;
+pub mod handler;
 
-pub use handler::ws_handler;
+pub use handler::{ws_handler, WalletBalanceUpdate};

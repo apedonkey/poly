@@ -1,6 +1,7 @@
 //! Trade API endpoints
 
 use crate::api::server::AppState;
+use crate::services::{EndpointClass, derive_safe_wallet};
 use crate::types::{Side, StrategyType};
 use crate::wallet::decrypt_private_key;
 use axum::{
@@ -17,43 +18,49 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use base64::Engine;
-use tracing::{info, warn};
-use alloy::primitives::{keccak256, Address, B256};
+use tracing::{info, warn, debug};
+use alloy::primitives::U256;
+use alloy::signers::{local::PrivateKeySigner, Signer};
+use polymarket_client_sdk::clob::{
+    Client as ClobClient, Config as ClobConfig,
+};
+use polymarket_client_sdk::clob::types::{
+    Amount, OrderType as ClobOrderType, Side as ClobSide,
+};
 
-/// Safe Proxy Factory address on Polygon
-const SAFE_FACTORY: &str = "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b";
-/// Init code hash for Safe proxy
-const SAFE_INIT_CODE_HASH: &str = "0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf";
-
-/// Derive the Polymarket Safe proxy wallet address from an EOA address
-/// Uses CREATE2: address = keccak256(0xff ++ factory ++ salt ++ init_code_hash)[12:]
-fn derive_safe_wallet(eoa_address: &str) -> Result<String, String> {
-    // Parse addresses
-    let eoa: Address = eoa_address.parse()
-        .map_err(|e| format!("Invalid EOA address: {}", e))?;
-    let factory: Address = SAFE_FACTORY.parse()
-        .map_err(|e| format!("Invalid factory address: {}", e))?;
-    let init_code_hash: B256 = SAFE_INIT_CODE_HASH.parse()
-        .map_err(|e| format!("Invalid init code hash: {}", e))?;
-
-    // Salt = keccak256(abi.encode(address)) - address padded to 32 bytes (left-padded with zeros)
-    let mut padded = [0u8; 32];
-    padded[12..32].copy_from_slice(eoa.as_slice());
-    let salt = keccak256(&padded);
-
-    // CREATE2: keccak256(0xff ++ factory ++ salt ++ init_code_hash)
-    let mut data = Vec::with_capacity(1 + 20 + 32 + 32);
-    data.push(0xff);
-    data.extend_from_slice(factory.as_slice());
-    data.extend_from_slice(salt.as_slice());
-    data.extend_from_slice(init_code_hash.as_slice());
-
-    let hash = keccak256(&data);
-    // Take last 20 bytes as address
-    let proxy_address = Address::from_slice(&hash[12..]);
-
-    Ok(format!("{:?}", proxy_address))
+/// Check order scoring via CLOB API (non-blocking, logs result)
+async fn check_order_scoring(token_id: &str, side: &str, price: &str, size: &str) {
+    let url = format!(
+        "https://clob.polymarket.com/order-scoring?token_id={}&side={}&price={}&size={}",
+        token_id, side, price, size
+    );
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.text().await {
+                info!("Order scoring result for {} {} at {}: {}", side, token_id, price, body);
+                // Parse and warn if score is low
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(score) = json.get("score").and_then(|s| s.as_f64()) {
+                        if score < 0.5 {
+                            warn!("Low order score ({:.2}) for {} {} at {} - order may not be favorable", score, side, token_id, price);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(resp) => {
+            debug!("Order scoring returned {}: non-success status", resp.status());
+        }
+        Err(e) => {
+            debug!("Order scoring check failed (non-blocking): {}", e);
+        }
+    }
 }
+
+/// Polygon chain ID
+const POLYGON_CHAIN_ID: u64 = 137;
+/// CLOB API endpoint
+const CLOB_ENDPOINT: &str = "https://clob.polymarket.com";
 
 /// Execute trade request
 #[derive(Debug, Deserialize)]
@@ -63,6 +70,17 @@ pub struct ExecuteTradeRequest {
     pub size_usdc: String,
     /// Password to decrypt private key for live trading
     pub password: String,
+    /// Order type: "market", "limit", "gtd", or "fak"
+    pub order_type: Option<String>,
+    /// Limit price in cents (e.g., "45" for 45c) - only for limit orders
+    pub limit_price: Option<String>,
+    /// Take profit price in cents - places a sell limit order after buy
+    pub take_profit_price: Option<String>,
+    /// Post-only flag - if true, order will be rejected if it would cross the spread (maker only).
+    /// Only valid for limit/gtd orders.
+    pub post_only: Option<bool>,
+    /// Expiration timestamp (Unix seconds) for GTD orders
+    pub expiration: Option<i64>,
 }
 
 /// Paper trade request (no password needed)
@@ -132,13 +150,13 @@ pub async fn execute_trade(
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Wallet has no stored encrypted key. Use paper trading or import key client-side.".to_string(),
+                    error: "Wallet has no stored encrypted key".to_string(),
                 }),
             )
         })?;
 
     // Decrypt private key
-    let _private_key = decrypt_private_key(&encrypted_key, &req.password).map_err(|_| {
+    let private_key = decrypt_private_key(&encrypted_key, &req.password).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -171,17 +189,20 @@ pub async fn execute_trade(
         )
     })?;
 
-    // Find the opportunity to get the entry price
+    // Find the opportunity to get entry price and token_id
     let opportunities = state.opportunities.read().await;
     let opportunity = opportunities
         .iter()
         .find(|o| o.market_id == req.market_id && o.side == side);
 
-    let entry_price = match opportunity {
-        Some(opp) => opp.entry_price,
+    let (entry_price, token_id, question, slug) = match opportunity {
+        Some(opp) => (
+            opp.entry_price,
+            opp.token_id.clone(),
+            opp.question.clone(),
+            opp.slug.clone(),
+        ),
         None => {
-            // If no matching opportunity, this might be a manual trade
-            // For now, reject it
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -191,34 +212,304 @@ pub async fn execute_trade(
         }
     };
 
+    let token_id = token_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Token ID not available for this market".to_string(),
+            }),
+        )
+    })?;
+
     // Calculate end_date from opportunity's time_to_close_hours
     let end_date = opportunity
         .and_then(|o| o.time_to_close_hours)
         .map(|hours| Utc::now() + Duration::seconds((hours * 3600.0) as i64));
 
-    // Get token_id from opportunity
-    let token_id = opportunity.and_then(|o| o.token_id.clone());
+    // Determine order type and price
+    let order_type_str = req.order_type.as_deref().unwrap_or("market");
+    let is_limit = matches!(order_type_str, "limit" | "gtd" | "fak");
+    let limit_price_decimal = if is_limit {
+        req.limit_price
+            .as_ref()
+            .and_then(|p| p.parse::<f64>().ok())
+            .map(|p| Decimal::from_str(&format!("{:.4}", p / 100.0)).unwrap_or(entry_price))
+    } else {
+        None
+    };
+    let post_only = req.post_only.unwrap_or(false);
 
-    // Get slug from opportunity
-    let slug = opportunity.map(|o| o.slug.clone());
+    info!(
+        "Executing LIVE trade for wallet {} - market: {}, side: {:?}, size: ${}, order_type: {}, price: {:?}, post_only: {}",
+        session.wallet_address, req.market_id, side, size,
+        order_type_str,
+        limit_price_decimal.unwrap_or(entry_price),
+        post_only
+    );
 
-    // TODO: Actually execute the trade using Executor with the decrypted private key
-    // For now, just record as paper trade
+    // Create signer from private key
+    let signer: PrivateKeySigner = private_key.parse().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to parse private key: {}", e),
+            }),
+        )
+    })?;
+    let signer = signer.with_chain_id(Some(POLYGON_CHAIN_ID));
+
+    // Create CLOB config
+    let clob_config = ClobConfig::builder()
+        .use_server_time(true)
+        .build();
+
+    // Create and authenticate client
+    debug!("Authenticating with CLOB API...");
+    let client = ClobClient::new(CLOB_ENDPOINT, clob_config)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create CLOB client: {}", e),
+                }),
+            )
+        })?
+        .authentication_builder(&signer)
+        .authenticate()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("Failed to authenticate with CLOB: {}", e),
+                }),
+            )
+        })?;
+
+    info!("CLOB client authenticated successfully");
+
+    // Convert token_id to U256
+    let token_id_u256 = U256::from_str_radix(&token_id, 10).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid token ID: {}", e),
+            }),
+        )
+    })?;
+
+    // We're always buying (either YES or NO tokens)
+    let clob_side = ClobSide::Buy;
+
+    // Check order scoring (non-blocking)
+    let scoring_price = limit_price_decimal.unwrap_or(entry_price);
+    let scoring_side = "BUY";
+    check_order_scoring(&token_id, scoring_side, &scoring_price.to_string(), &size.to_string()).await;
+
+    // Build and execute the order using market_order builder (supports FOK, GTC, GTD, FAK)
+    let order_id = if is_limit {
+        // Limit-style order (GTC, GTD, or FAK)
+        let price = limit_price_decimal.unwrap_or(entry_price);
+
+        // Determine the CLOB order type
+        let clob_order_type = match order_type_str {
+            "gtd" => ClobOrderType::GTD,
+            "fak" => ClobOrderType::FAK,
+            _ => ClobOrderType::GTC, // "limit" defaults to GTC
+        };
+
+        debug!("Creating {} order: token={}, amount=${}, price={}, side={:?}, post_only={}",
+               order_type_str.to_uppercase(), token_id, size, price, clob_side, post_only);
+
+        let mut builder = client
+            .market_order()
+            .token_id(token_id_u256)
+            .amount(Amount::usdc(size).map_err(|e| {
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                    error: format!("Invalid amount: {}", e),
+                }))
+            })?)
+            .side(clob_side)
+            .price(price)
+            .order_type(clob_order_type);
+
+        // Post-only: only valid for GTC/GTD, rejected if order would cross spread
+        if post_only {
+            builder = builder.post_only(true);
+        }
+
+        // Expiration: only valid for GTD orders
+        if order_type_str == "gtd" {
+            if let Some(exp_ts) = req.expiration {
+                let exp_dt = DateTime::from_timestamp(exp_ts, 0).unwrap_or_else(|| Utc::now() + Duration::hours(24));
+                builder = builder.expiration(exp_dt);
+            } else {
+                // Default GTD expiration: 24 hours from now
+                builder = builder.expiration(Utc::now() + Duration::hours(24));
+            }
+        }
+
+        let order = builder
+            .build()
+            .await
+            .map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                    error: format!("Failed to build {} order: {}", order_type_str, e),
+                }))
+            })?;
+
+        let signed_order = client.sign(&signer, order).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                error: format!("Failed to sign order: {}", e),
+            }))
+        })?;
+
+        if state.rate_limiter.acquire(EndpointClass::PostOrder).await {
+            state.metrics.inc_api_rate_limited();
+        }
+        state.metrics.inc_api_calls();
+        let response = client.post_order(signed_order).await.map_err(|e| {
+            state.metrics.inc_orders_failed();
+            state.metrics.inc_api_errors();
+            (StatusCode::BAD_GATEWAY, Json(ErrorResponse {
+                error: format!("Failed to submit order: {}", e),
+            }))
+        })?;
+
+        state.metrics.inc_orders_submitted();
+        state.metrics.inc_order_type(order_type_str);
+        info!("{} order submitted: {:?}", order_type_str.to_uppercase(), response);
+        response.order_id
+    } else {
+        // Market order (FOK - Fill or Kill) with slippage protection
+        let slippage = Decimal::try_from(state.config.slippage_tolerance).unwrap_or(Decimal::new(5, 3));
+        let worst_case_price = match clob_side {
+            ClobSide::Buy => entry_price * (Decimal::ONE + slippage),
+            ClobSide::Sell => entry_price * (Decimal::ONE - slippage),
+            _ => entry_price, // Fallback for any future SDK side variants
+        };
+        debug!("Creating MARKET order: token={}, amount=${}, side={:?}, slippage_price={}",
+               token_id, size, clob_side, worst_case_price);
+
+        let order = client
+            .market_order()
+            .token_id(token_id_u256)
+            .amount(Amount::usdc(size).map_err(|e| {
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                    error: format!("Invalid amount: {}", e),
+                }))
+            })?)
+            .side(clob_side)
+            .price(worst_case_price)
+            .order_type(ClobOrderType::FOK)
+            .build()
+            .await
+            .map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                    error: format!("Failed to build market order: {}", e),
+                }))
+            })?;
+
+        let signed_order = client.sign(&signer, order).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                error: format!("Failed to sign order: {}", e),
+            }))
+        })?;
+
+        if state.rate_limiter.acquire(EndpointClass::PostOrder).await {
+            state.metrics.inc_api_rate_limited();
+        }
+        state.metrics.inc_api_calls();
+        let response = client.post_order(signed_order).await.map_err(|e| {
+            state.metrics.inc_orders_failed();
+            state.metrics.inc_api_errors();
+            (StatusCode::BAD_GATEWAY, Json(ErrorResponse {
+                error: format!("Failed to submit order: {}", e),
+            }))
+        })?;
+
+        state.metrics.inc_orders_submitted();
+        state.metrics.inc_order_type("FOK");
+        info!("MARKET order submitted: {:?}", response);
+        response.order_id
+    };
+
+    // Place take profit order if requested
+    let mut take_profit_order_id: Option<String> = None;
+    if let Some(tp_price_str) = &req.take_profit_price {
+        if let Ok(tp_cents) = tp_price_str.parse::<f64>() {
+            let tp_price = Decimal::from_str(&format!("{:.4}", tp_cents / 100.0))
+                .unwrap_or_else(|_| entry_price + Decimal::from_str("0.1").unwrap());
+
+            // Calculate shares from size and entry price
+            let shares = size / limit_price_decimal.unwrap_or(entry_price);
+
+            info!("Placing TAKE PROFIT sell order at {}c for {} shares", tp_cents, shares);
+
+            // Use market_order builder with GTC for take profit sell order
+            let tp_order = client
+                .market_order()
+                .token_id(token_id_u256)
+                .amount(Amount::shares(shares).map_err(|e| {
+                    warn!("Failed to create TP amount: {}", e);
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                        error: format!("Invalid TP amount: {}", e),
+                    }))
+                })?)
+                .side(ClobSide::Sell)
+                .price(tp_price)
+                .order_type(ClobOrderType::GTC)
+                .build()
+                .await;
+
+            match tp_order {
+                Ok(order) => {
+                    match client.sign(&signer, order).await {
+                        Ok(signed) => {
+                            if state.rate_limiter.acquire(EndpointClass::PostOrder).await {
+                                state.metrics.inc_api_rate_limited();
+                            }
+                            state.metrics.inc_api_calls();
+                            match client.post_order(signed).await {
+                                Ok(response) => {
+                                    state.metrics.inc_orders_submitted();
+                                    state.metrics.inc_order_type("GTC");
+                                    info!("Take profit order placed: {:?}", response);
+                                    take_profit_order_id = Some(response.order_id);
+                                }
+                                Err(e) => {
+                                    state.metrics.inc_orders_failed();
+                                    state.metrics.inc_api_errors();
+                                    warn!("Failed to submit TP order: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => warn!("Failed to sign TP order: {}", e),
+                    }
+                }
+                Err(e) => warn!("Failed to build TP order: {}", e),
+            }
+        }
+    }
+
+    // Record the position in database
+    let actual_entry_price = limit_price_decimal.unwrap_or(entry_price);
     let position_id = state
         .db
         .create_position_for_wallet(
             &session.wallet_address,
             &req.market_id,
-            &opportunity.map(|o| o.question.clone()).unwrap_or_default(),
-            slug.as_deref(),
+            &question,
+            Some(&slug),
             side,
-            entry_price,
+            actual_entry_price,
             size,
-            StrategyType::ResolutionSniper, // TODO: Get from opportunity
+            StrategyType::ResolutionSniper,
             false, // Live trade
             end_date,
-            token_id.as_deref(),
-            None, // No order_id for this flow yet
+            Some(&token_id),
+            Some(&order_id),
+            false, // neg_risk: TODO detect from market data
         )
         .await
         .map_err(|e| {
@@ -230,10 +521,24 @@ pub async fn execute_trade(
             )
         })?;
 
+    let message = if is_limit {
+        if take_profit_order_id.is_some() {
+            format!("Limit buy order placed (ID: {}) with take profit", order_id)
+        } else {
+            format!("Limit buy order placed (ID: {})", order_id)
+        }
+    } else {
+        if take_profit_order_id.is_some() {
+            format!("Market order executed (ID: {}) with take profit", order_id)
+        } else {
+            format!("Market order executed (ID: {})", order_id)
+        }
+    };
+
     Ok(Json(TradeResponse {
         success: true,
         position_id: Some(position_id),
-        message: "Trade executed (paper mode - live trading coming soon)".to_string(),
+        message,
     }))
 }
 
@@ -327,6 +632,7 @@ pub async fn paper_trade(
             end_date,
             token_id.as_deref(),
             None, // Paper trades don't have order_id
+            false, // neg_risk
         )
         .await
         .map_err(|e| {
@@ -538,6 +844,7 @@ pub async fn execute_signed_trade(
             end_date,
             Some(&req.token_id),
             order_id.as_deref(),
+            false, // neg_risk
         )
         .await
         .map_err(|e| {
@@ -660,6 +967,7 @@ pub async fn record_position(
             end_date,
             Some(&req.token_id),
             req.order_id.as_deref(),
+            false, // neg_risk
         )
         .await
         .map_err(|e| {
@@ -940,6 +1248,12 @@ pub async fn submit_sdk_order(
             )
         })?;
 
+    // Rate limit order submission
+    if state.rate_limiter.acquire(EndpointClass::PostOrder).await {
+        state.metrics.inc_api_rate_limited();
+    }
+    state.metrics.inc_api_calls();
+
     let response = client
         .post("https://clob.polymarket.com/order")
         .header("Content-Type", "application/json")
@@ -978,6 +1292,8 @@ pub async fn submit_sdk_order(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        state.metrics.inc_orders_submitted();
+        state.metrics.inc_order_type("FOK");
         Ok(Json(SubmitOrderResponse {
             success: true,
             order_id,
@@ -986,6 +1302,8 @@ pub async fn submit_sdk_order(
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        state.metrics.inc_orders_failed();
+        state.metrics.inc_api_errors();
         warn!("CLOB error {}: {}", status, body);
 
         Ok(Json(SubmitOrderResponse {
@@ -1017,10 +1335,6 @@ pub async fn enable_trading(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
     Json(req): Json<EnableTradingRequest>,
 ) -> Result<Json<EnableTradingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
     // Validate session
     let session = state
         .db
@@ -1120,8 +1434,8 @@ pub async fn enable_trading(
     }
 }
 
-/// Helper to set a specific allowance type
-async fn set_allowance(
+/// Helper to set a specific allowance type via CLOB API
+pub async fn set_allowance(
     client: &reqwest::Client,
     wallet_address: &str,
     api_key: &str,

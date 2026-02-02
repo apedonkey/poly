@@ -190,9 +190,11 @@ export const PositionCard = memo(function PositionCard({ position, onSell, onTok
             <span className={`text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded ${
               position.strategy === 'ResolutionSniper'
                 ? 'bg-yellow-500/20 text-yellow-400'
+                : position.strategy === 'Dispute'
+                ? 'bg-red-500/20 text-red-400'
                 : 'bg-blue-500/20 text-blue-400'
             }`}>
-              {position.strategy === 'ResolutionSniper' ? 'Sniper' : 'NO Bias'}
+              {position.strategy === 'ResolutionSniper' ? 'Sniper' : position.strategy === 'Dispute' ? 'Dispute' : 'MC'}
             </span>
             {position.is_paper && (
               <span className="text-xs font-medium px-1.5 sm:px-2 py-0.5 rounded bg-purple-500/20 text-purple-400 flex items-center gap-1">

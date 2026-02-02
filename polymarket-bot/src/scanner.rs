@@ -1,9 +1,10 @@
 //! Market scanner for Polymarket Gamma API
 
 use crate::config::{Config, GammaApi};
-use crate::types::TrackedMarket;
+use crate::types::{MarketHolder, MarketHolders, TrackedMarket};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use std::collections::HashMap;
 use chrono_tz::Tz;
 use regex::Regex;
 use reqwest::Client;
@@ -38,6 +39,7 @@ struct GammaMarket {
     #[serde(default)]
     end_date: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     outcomes: Option<String>,
     #[serde(default)]
     outcome_prices: Option<String>,
@@ -57,6 +59,9 @@ struct GammaMarket {
     tags: Option<Vec<GammaTag>>,
     #[serde(default)]
     events: Option<Vec<GammaEvent>>,
+    /// Whether this is a neg-risk market (uses different exchange contract)
+    #[serde(default, rename = "negRisk")]
+    neg_risk: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +69,7 @@ struct GammaTag {
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     slug: Option<String>,
 }
 
@@ -74,7 +80,29 @@ struct GammaEvent {
     #[serde(default)]
     slug: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     title: Option<String>,
+}
+
+/// Response from the Polymarket Data API /holders endpoint
+#[derive(Debug, Deserialize)]
+struct HolderResponse {
+    token: String,
+    holders: Vec<HolderEntry>,
+}
+
+/// Individual holder entry from the Data API
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HolderEntry {
+    #[serde(default)]
+    proxy_wallet: String,
+    #[serde(default)]
+    amount: f64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    outcome_index: u8,
 }
 
 impl Scanner {
@@ -147,7 +175,78 @@ impl Scanner {
         Ok(all_markets)
     }
 
-    /// Fetch markets with specific filters for sniper strategy
+    /// Fetch markets with server-side filters optimized for the sniper strategy.
+    /// Uses Gamma API's `liquidity_num_min` and `end_date_max` to reduce results
+    /// from ~25K to ~100-200, cutting API calls from ~260 to 1-2.
+    pub async fn fetch_sniper_markets(&self, max_hours: f64) -> Result<Vec<TrackedMarket>> {
+        let mut all_markets = Vec::new();
+        let mut offset = 0;
+        let limit = 100;
+
+        // Compute the end_date_max cutoff: now + max_hours
+        let end_date_max = (Utc::now() + chrono::Duration::hours(max_hours as i64))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        let min_liquidity = self.config.min_liquidity;
+
+        loop {
+            let url = format!(
+                "{}?active=true&closed=false&limit={}&offset={}&liquidity_num_min={}&end_date_max={}",
+                GammaApi::markets_url(),
+                limit,
+                offset,
+                min_liquidity,
+                end_date_max
+            );
+
+            debug!("Fetching sniper markets from: {}", url);
+
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch sniper markets")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("API error {}: {}", status, body);
+            }
+
+            let gamma_markets: Vec<GammaMarket> = response
+                .json()
+                .await
+                .context("Failed to parse sniper market response")?;
+
+            let batch_size = gamma_markets.len();
+            debug!("Fetched {} sniper markets", batch_size);
+
+            for gm in gamma_markets {
+                if let Some(market) = self.parse_market(gm) {
+                    all_markets.push(market);
+                }
+            }
+
+            if batch_size < limit {
+                break;
+            }
+
+            offset += limit;
+
+            // Safety limit
+            if offset > 5000 {
+                warn!("Reached safety limit for sniper markets");
+                break;
+            }
+        }
+
+        info!("Total sniper-filtered markets fetched: {}", all_markets.len());
+        Ok(all_markets)
+    }
+
+    /// Fetch markets with specific filters for sniper strategy (client-side filtering)
     pub async fn fetch_closing_soon(&self, max_hours: f64) -> Result<Vec<TrackedMarket>> {
         let markets = self.fetch_markets().await?;
 
@@ -162,6 +261,118 @@ impl Scanner {
 
         info!("Markets closing within {} hours: {}", max_hours, closing_soon.len());
         Ok(closing_soon)
+    }
+
+    /// Fetch top holders for a batch of markets from the Polymarket Data API.
+    /// Returns a map of condition_id -> MarketHolders.
+    ///
+    /// `token_to_condition` maps CLOB token_id -> condition_id because the Data API
+    /// returns results keyed by token_id, not condition_id. YES and NO token results
+    /// are merged into a single `MarketHolders` per condition_id.
+    pub async fn fetch_holders(
+        &self,
+        condition_ids: &[String],
+        token_to_condition: &HashMap<String, String>,
+    ) -> Result<HashMap<String, MarketHolders>> {
+        if condition_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut all_results: HashMap<String, MarketHolders> = HashMap::new();
+
+        // Batch in groups of 10 to avoid overly long URLs
+        for chunk in condition_ids.chunks(10) {
+            let market_param = chunk.join(",");
+            let url = format!(
+                "https://data-api.polymarket.com/holders?market={}&limit=20",
+                market_param
+            );
+
+            let response = match self.client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Holders API request failed: {}", e);
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Holders API error {}: {}", status, body);
+                continue;
+            }
+
+            let holder_responses: Vec<HolderResponse> = match response.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to parse holders response: {}", e);
+                    continue;
+                }
+            };
+
+            for resp in holder_responses {
+                // Look up the condition_id for this token_id
+                let condition_id = match token_to_condition.get(&resp.token) {
+                    Some(cid) => cid.clone(),
+                    None => {
+                        debug!("Skipping unknown token_id in holders response: {}", resp.token);
+                        continue;
+                    }
+                };
+
+                let mut yes_holders = Vec::new();
+                let mut no_holders = Vec::new();
+
+                for h in resp.holders {
+                    let display_name = if h.name.is_empty() {
+                        // Truncate address for display
+                        if h.proxy_wallet.len() > 10 {
+                            format!("{}...{}", &h.proxy_wallet[..6], &h.proxy_wallet[h.proxy_wallet.len() - 4..])
+                        } else {
+                            h.proxy_wallet.clone()
+                        }
+                    } else {
+                        h.name
+                    };
+
+                    let holder = MarketHolder {
+                        address: h.proxy_wallet,
+                        amount: h.amount,
+                        name: display_name,
+                        outcome_index: h.outcome_index,
+                    };
+
+                    if h.outcome_index == 0 {
+                        yes_holders.push(holder);
+                    } else {
+                        no_holders.push(holder);
+                    }
+                }
+
+                // Merge into existing entry for this condition_id (YES and NO tokens
+                // are separate responses that should be combined)
+                let entry = all_results.entry(condition_id).or_insert_with(|| MarketHolders {
+                    yes_holders: Vec::new(),
+                    no_holders: Vec::new(),
+                    yes_total_count: 0,
+                    no_total_count: 0,
+                });
+
+                entry.yes_total_count += yes_holders.len();
+                entry.no_total_count += no_holders.len();
+                entry.yes_holders.extend(yes_holders);
+                entry.no_holders.extend(no_holders);
+
+                // Keep only top 5 per side after merging
+                entry.yes_holders.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(std::cmp::Ordering::Equal));
+                entry.no_holders.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(std::cmp::Ordering::Equal));
+                entry.yes_holders.truncate(5);
+                entry.no_holders.truncate(5);
+            }
+        }
+
+        Ok(all_results)
     }
 
     /// Parse a Gamma API market into our TrackedMarket type
@@ -189,24 +400,38 @@ impl Scanner {
             .as_ref()
             .and_then(|desc| self.parse_resolution_date_from_description(desc));
 
-        // Use the description date if:
+        // Also try parsing from the question/title as a fallback
+        // Many markets have dates in titles like "Will X happen by February 28, 2026?"
+        let question_end_date = self.parse_resolution_date_from_description(&gm.question);
+
+        // Pick the best date: description > question > API
+        // Description is most specific (often has exact time), question is next, API is fallback
+        let parsed_date = description_end_date.or(question_end_date);
+
+        // Use the parsed date if:
         // 1. We found one, AND
-        // 2. Either there's no API date, OR the description date is later (more specific)
-        let end_date = match (description_end_date, api_end_date) {
-            (Some(desc_date), Some(api_date)) => {
-                // If description date is later than API date, use it (it's more specific)
+        // 2. Either there's no API date, OR the parsed date is later (more specific)
+        let end_date = match (parsed_date, api_end_date) {
+            (Some(parsed), Some(api_date)) => {
+                // If parsed date is later than API date, use it (it's more specific)
                 // e.g., API says midnight, description says 2:30 PM
-                if desc_date > api_date {
+                if parsed > api_date {
                     debug!(
-                        "Using description date {} instead of API date {} for market",
-                        desc_date, api_date
+                        "Using parsed date {} instead of API date {} for market: {}",
+                        parsed, api_date, gm.question
                     );
-                    Some(desc_date)
+                    Some(parsed)
                 } else {
                     Some(api_date)
                 }
             }
-            (Some(desc_date), None) => Some(desc_date),
+            (Some(parsed), None) => {
+                debug!(
+                    "Using title/description date {} for market with no API date: {}",
+                    parsed, gm.question
+                );
+                Some(parsed)
+            }
             (None, Some(api_date)) => Some(api_date),
             (None, None) => None,
         };
@@ -277,6 +502,7 @@ impl Scanner {
             yes_token_id,
             no_token_id,
             hours_until_close,
+            neg_risk: gm.neg_risk,
         })
     }
 

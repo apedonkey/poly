@@ -26,6 +26,8 @@ pub struct TrackedMarket {
     pub yes_token_id: Option<String>,
     pub no_token_id: Option<String>,
     pub hours_until_close: Option<f64>,
+    /// Whether this is a neg-risk market (uses different exchange contract)
+    pub neg_risk: bool,
 }
 
 impl TrackedMarket {
@@ -80,16 +82,161 @@ impl fmt::Display for Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyType {
     ResolutionSniper,
-    NoBias,
+    Dispute,
+    MillionairesClub,
+    MintMaker,
 }
 
 impl fmt::Display for StrategyType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StrategyType::ResolutionSniper => write!(f, "Sniper"),
-            StrategyType::NoBias => write!(f, "NO Bias"),
+            StrategyType::Dispute => write!(f, "Dispute"),
+            StrategyType::MillionairesClub => write!(f, "MC"),
+            StrategyType::MintMaker => write!(f, "MintMaker"),
         }
     }
+}
+
+// ==================== MINT MAKER TYPES ====================
+
+/// Crypto assets supported by Mint Maker
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum CryptoAsset {
+    BTC,
+    ETH,
+    SOL,
+    XRP,
+}
+
+impl fmt::Display for CryptoAsset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CryptoAsset::BTC => write!(f, "BTC"),
+            CryptoAsset::ETH => write!(f, "ETH"),
+            CryptoAsset::SOL => write!(f, "SOL"),
+            CryptoAsset::XRP => write!(f, "XRP"),
+        }
+    }
+}
+
+impl CryptoAsset {
+    /// Keywords to match this asset in market questions
+    pub fn keywords(&self) -> &[&str] {
+        match self {
+            CryptoAsset::BTC => &["btc", "bitcoin"],
+            CryptoAsset::ETH => &["eth", "ethereum"],
+            CryptoAsset::SOL => &["sol", "solana"],
+            CryptoAsset::XRP => &["xrp", "ripple"],
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "BTC" => Some(CryptoAsset::BTC),
+            "ETH" => Some(CryptoAsset::ETH),
+            "SOL" => Some(CryptoAsset::SOL),
+            "XRP" => Some(CryptoAsset::XRP),
+            _ => None,
+        }
+    }
+
+    /// All supported assets
+    pub fn all() -> &'static [CryptoAsset] {
+        &[CryptoAsset::BTC, CryptoAsset::ETH, CryptoAsset::SOL, CryptoAsset::XRP]
+    }
+
+    /// Lowercase slug for event URL construction
+    pub fn slug(&self) -> &'static str {
+        match self {
+            CryptoAsset::BTC => "btc",
+            CryptoAsset::ETH => "eth",
+            CryptoAsset::SOL => "sol",
+            CryptoAsset::XRP => "xrp",
+        }
+    }
+}
+
+/// A 15-min crypto Up/Down market eligible for mint making
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintMakerMarket {
+    pub market_id: String,
+    pub condition_id: String,
+    pub question: String,
+    pub slug: String,
+    pub asset: CryptoAsset,
+    pub yes_token_id: String,
+    pub no_token_id: String,
+    pub yes_price: Decimal,
+    pub no_price: Decimal,
+    pub minutes_to_close: f64,
+    pub neg_risk: bool,
+}
+
+/// Status of a mint maker order pair
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MintMakerPairStatus {
+    /// Both orders placed, waiting for fills
+    Pending,
+    /// One side filled, other still open
+    HalfFilled,
+    /// Both sides filled, ready to merge
+    Matched,
+    /// Merge in progress
+    Merging,
+    /// Successfully merged back to USDC
+    Merged,
+    /// Cancelled (stale, manual, or error)
+    Cancelled,
+}
+
+impl fmt::Display for MintMakerPairStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MintMakerPairStatus::Pending => write!(f, "Pending"),
+            MintMakerPairStatus::HalfFilled => write!(f, "HalfFilled"),
+            MintMakerPairStatus::Matched => write!(f, "Matched"),
+            MintMakerPairStatus::Merging => write!(f, "Merging"),
+            MintMakerPairStatus::Merged => write!(f, "Merged"),
+            MintMakerPairStatus::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+/// A tracked order pair for mint making
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintMakerPair {
+    pub id: i64,
+    pub wallet_address: String,
+    pub market_id: String,
+    pub condition_id: String,
+    pub question: String,
+    pub asset: String,
+    pub yes_order_id: String,
+    pub no_order_id: String,
+    pub yes_bid_price: Decimal,
+    pub no_bid_price: Decimal,
+    pub yes_fill_price: Option<Decimal>,
+    pub no_fill_price: Option<Decimal>,
+    pub pair_cost: Option<Decimal>,
+    pub profit: Option<Decimal>,
+    pub size: Decimal,
+    pub status: MintMakerPairStatus,
+    pub merge_tx_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Aggregate stats for mint maker
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MintMakerStats {
+    pub total_pairs: i64,
+    pub merged_pairs: i64,
+    pub cancelled_pairs: i64,
+    pub total_profit: Decimal,
+    pub total_cost: Decimal,
+    pub avg_spread: f64,
+    pub fill_rate: f64,
 }
 
 /// A trading opportunity identified by a strategy
@@ -115,14 +262,38 @@ pub struct Opportunity {
     pub recommendation: String,
     /// Token ID for CLOB trading (YES or NO token depending on side)
     pub token_id: Option<String>,
+    /// Whether this is a neg-risk market
+    #[serde(default)]
+    pub neg_risk: bool,
     /// Whether the opportunity currently meets all filter criteria.
     /// Updated in real-time as prices change. False = temporarily outside thresholds.
     #[serde(default = "default_meets_criteria")]
     pub meets_criteria: bool,
+    /// Top holders on each side of the market
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holders: Option<MarketHolders>,
 }
 
 fn default_meets_criteria() -> bool {
     true
+}
+
+/// A market holder (top holder on YES or NO side)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketHolder {
+    pub address: String,
+    pub amount: f64,
+    pub name: String,
+    pub outcome_index: u8,
+}
+
+/// Top holders for both sides of a market
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketHolders {
+    pub yes_holders: Vec<MarketHolder>,
+    pub no_holders: Vec<MarketHolder>,
+    pub yes_total_count: usize,
+    pub no_total_count: usize,
 }
 
 impl Opportunity {
@@ -248,8 +419,9 @@ impl Opportunity {
             StrategyType::ResolutionSniper => {
                 self.recalculate_sniper(price_f64)
             }
-            StrategyType::NoBias => {
-                self.recalculate_no_bias(price_f64)
+            StrategyType::Dispute | StrategyType::MillionairesClub | StrategyType::MintMaker => {
+                // Disputes, MC, and MintMaker don't use sniper price filtering
+                true
             }
         };
 
@@ -298,44 +470,6 @@ impl Opportunity {
             if no_bias_bonus { " [NO BIAS+]" } else { "" }
         );
 
-        true
-    }
-
-    /// Recalculate NO bias opportunity metrics
-    /// Note: NO bias opportunities are NOT filtered out in real-time since they're
-    /// longer-term plays. We just update the metrics for display.
-    fn recalculate_no_bias(&mut self, price: f64) -> bool {
-        // NO bias config defaults
-        const HISTORICAL_NO_RATE: f64 = 0.784;
-
-        // Recalculate expected return
-        self.expected_return = (1.0 - price) / price;
-
-        // Recalculate edge: historical NO rate - current NO price
-        self.edge = HISTORICAL_NO_RATE - price;
-
-        // Update recommendation string
-        let hours_str = self.time_to_close_hours
-            .map(|h| {
-                if h > 24.0 * 7.0 {
-                    format!("{:.0} weeks", h / (24.0 * 7.0))
-                } else if h > 24.0 {
-                    format!("{:.0} days", h / 24.0)
-                } else {
-                    format!("{:.0}h", h)
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        self.recommendation = format!(
-            "BUY NO at {:.0}c | {:.1}% edge vs {:.1}% base rate | {} left",
-            price * 100.0,
-            self.edge * 100.0,
-            HISTORICAL_NO_RATE * 100.0,
-            hours_str
-        );
-
-        // NO bias always stays visible - filtering happens at next scan
         true
     }
 
@@ -391,7 +525,7 @@ impl Opportunity {
     }
 }
 
-/// Order status for tracking
+/// Order status for tracking (legacy)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     Pending,
@@ -399,6 +533,74 @@ pub enum OrderStatus {
     PartiallyFilled,
     Cancelled,
     Rejected,
+}
+
+/// Order lifecycle status matching Polymarket CLOB states
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderLifecycleStatus {
+    /// Order submitted but not yet confirmed
+    Pending,
+    /// Order is live on the orderbook
+    Live,
+    /// Order matched (waiting for on-chain confirmation)
+    Matched,
+    /// Order transaction submitted to blockchain
+    Mined,
+    /// Order fully confirmed on-chain
+    Confirmed,
+    /// Order failed to execute
+    Failed,
+    /// Order cancelled by user
+    Cancelled,
+}
+
+impl fmt::Display for OrderLifecycleStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OrderLifecycleStatus::Pending => write!(f, "Pending"),
+            OrderLifecycleStatus::Live => write!(f, "Live"),
+            OrderLifecycleStatus::Matched => write!(f, "Matched"),
+            OrderLifecycleStatus::Mined => write!(f, "Mined"),
+            OrderLifecycleStatus::Confirmed => write!(f, "Confirmed"),
+            OrderLifecycleStatus::Failed => write!(f, "Failed"),
+            OrderLifecycleStatus::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+/// A tracked order in the CLOB system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    /// Order ID from CLOB
+    pub id: String,
+    /// Wallet address that placed this order
+    pub wallet_address: String,
+    /// Token ID being traded
+    pub token_id: String,
+    /// Market ID (for linking to positions)
+    pub market_id: Option<String>,
+    /// Buy or Sell
+    pub side: Side,
+    /// Order type (FOK, GTC, GTD)
+    pub order_type: String,
+    /// Order price
+    pub price: Decimal,
+    /// Original size in USDC
+    pub original_size: Decimal,
+    /// Amount filled so far
+    pub filled_size: Decimal,
+    /// Average fill price (from actual fills)
+    pub avg_fill_price: Option<Decimal>,
+    /// Current lifecycle status
+    pub status: OrderLifecycleStatus,
+    /// Associated position ID if any
+    pub position_id: Option<i64>,
+    /// Whether this is a neg-risk market order
+    pub neg_risk: bool,
+    /// When the order was created
+    pub created_at: DateTime<Utc>,
+    /// Last status update
+    pub updated_at: DateTime<Utc>,
 }
 
 /// A tracked position
@@ -434,6 +636,10 @@ pub struct Position {
     pub total_sold_size: Option<Decimal>,
     /// Weighted average exit price from partial sells
     pub avg_exit_price: Option<Decimal>,
+    /// Whether this is a neg-risk market
+    pub neg_risk: bool,
+    /// Fee paid on this position (taker fee)
+    pub fee_paid: Option<Decimal>,
 }
 
 impl Position {
@@ -476,8 +682,6 @@ pub struct BotStats {
     pub total_pnl: Decimal,
     pub sniper_trades: i64,
     pub sniper_wins: i64,
-    pub no_bias_trades: i64,
-    pub no_bias_wins: i64,
     pub avg_hold_time_hours: f64,
 }
 
@@ -497,33 +701,6 @@ impl BotStats {
             (self.sniper_wins as f64 / self.sniper_trades as f64) * 100.0
         }
     }
-
-    pub fn no_bias_win_rate(&self) -> f64 {
-        if self.no_bias_trades == 0 {
-            0.0
-        } else {
-            (self.no_bias_wins as f64 / self.no_bias_trades as f64) * 100.0
-        }
-    }
-}
-
-// ==================== CLARIFICATION MONITOR TYPES ====================
-
-/// Alert when a market's description/clarification has been updated
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClarificationAlert {
-    pub market_id: String,
-    pub condition_id: String,
-    pub question: String,
-    pub slug: String,
-    pub old_description_hash: String,
-    /// First 500 chars of new description
-    pub new_description_preview: String,
-    /// Unix timestamp when detected
-    pub detected_at: i64,
-    pub current_yes_price: Decimal,
-    pub current_no_price: Decimal,
-    pub liquidity: Decimal,
 }
 
 // ==================== UMA DISPUTE TRACKER TYPES ====================
@@ -552,7 +729,8 @@ impl fmt::Display for DisputeStatus {
 /// Alert for an active UMA dispute on a Polymarket market
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisputeAlert {
-    pub market_id: String,
+    /// UMA assertion ID
+    pub assertion_id: String,
     pub condition_id: String,
     pub question: String,
     pub slug: String,
@@ -561,9 +739,35 @@ pub struct DisputeAlert {
     pub proposed_outcome: String,
     /// When the dispute started
     pub dispute_timestamp: i64,
-    /// Estimated when DVM vote ends
+    /// Estimated when challenge window / DVM vote ends (from actual expirationTime)
     pub estimated_resolution: i64,
     pub current_yes_price: Decimal,
     pub current_no_price: Decimal,
     pub liquidity: Decimal,
+    /// Token ID for YES outcome (for trading)
+    pub yes_token_id: Option<String>,
+    /// Token ID for NO outcome (for trading)
+    pub no_token_id: Option<String>,
+    /// Edge if proposed outcome wins (e.g., 0.15 = 15% profit)
+    pub edge: Option<Decimal>,
+    /// Which dispute round this is (1 = first proposal, 2 = re-proposal after first dispute)
+    /// UmaCtfAdapter uses a two-round mechanism: first dispute resets, second dispute goes to DVM
+    #[serde(default = "default_dispute_round")]
+    pub dispute_round: u8,
+    /// Proposer bond amount in USDC (typically $750)
+    #[serde(default)]
+    pub proposer_bond: Option<Decimal>,
+    /// Which UmaCtfAdapter version this assertion belongs to (e.g., "v1", "v2", "v3")
+    #[serde(default)]
+    pub adapter_version: Option<String>,
+    /// Liveness period in seconds (challenge window, typically 7200 = 2 hours)
+    #[serde(default)]
+    pub liveness_seconds: Option<i64>,
+    /// Expected value considering 50-50 outcome possibility
+    #[serde(default)]
+    pub expected_value: Option<Decimal>,
+}
+
+fn default_dispute_round() -> u8 {
+    1
 }

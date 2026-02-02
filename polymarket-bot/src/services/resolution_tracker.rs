@@ -15,9 +15,12 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
+    #[allow(dead_code)]
     condition_id: Option<String>,
     #[serde(rename = "questionID")]
+    #[allow(dead_code)]
     question_id: Option<String>,
+    #[allow(dead_code)]
     slug: Option<String>,
     resolved: Option<bool>,
     /// "Yes" or "No" - the winning outcome
@@ -33,6 +36,7 @@ struct GammaMarket {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GammaResponse {
     #[serde(default)]
     data: Vec<GammaMarket>,
@@ -94,7 +98,7 @@ impl ResolutionTracker {
                     debug!("Position {} still open", position.id);
                 }
                 Err(e) => {
-                    warn!("Failed to check position {}: {}", position.id, e);
+                    debug!("Failed to check position {}: {}", position.id, e);
                 }
             }
 

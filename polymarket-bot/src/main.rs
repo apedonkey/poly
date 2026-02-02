@@ -51,17 +51,6 @@ enum Commands {
         no_sports: bool,
     },
 
-    /// Show only NO bias opportunities
-    Bias {
-        /// Minimum edge percentage
-        #[arg(short, long, default_value = "10")]
-        min_edge: f64,
-
-        /// Maximum number of opportunities to show
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-    },
-
     /// Run the bot continuously (paper trading)
     Run {
         /// Scan interval in seconds
@@ -95,7 +84,6 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Scan { limit, no_sports } => scan_markets(&config, limit, no_sports).await?,
         Commands::Snipe { max_hours, limit, no_sports } => snipe_markets(&config, max_hours, limit, no_sports).await?,
-        Commands::Bias { min_edge, limit } => bias_markets(&config, min_edge, limit).await?,
         Commands::Run { interval, auto_execute } => run_bot(&config, interval, auto_execute).await?,
         Commands::Stats => show_stats(&config).await?,
     }
@@ -130,15 +118,10 @@ async fn scan_markets(config: &Config, limit: usize, no_sports: bool) -> Result<
     // Display sniper opportunities
     print_sniper_opportunities(&opportunities.sniper, limit);
 
-    // Display NO bias opportunities
-    print_no_bias_opportunities(&opportunities.no_bias, limit);
-
     // Summary
     println!("\n{}", "-".repeat(70));
     println!(
-        "Total: {} sniper + {} bias = {} opportunities",
-        opportunities.sniper.len(),
-        opportunities.no_bias.len(),
+        "Total: {} opportunities",
         opportunities.total_count()
     );
 
@@ -147,7 +130,6 @@ async fn scan_markets(config: &Config, limit: usize, no_sports: bool) -> Result<
     db.record_scan(
         markets.len() as i64,
         opportunities.sniper.len() as i64,
-        opportunities.no_bias.len() as i64,
     )
     .await?;
 
@@ -223,28 +205,6 @@ fn is_sports_market(question: &str, category: Option<&str>) -> bool {
     false
 }
 
-async fn bias_markets(config: &Config, min_edge: f64, limit: usize) -> Result<()> {
-    println!("\n{}", "=".repeat(70));
-    println!("  NO BIAS MODE - Minimum edge: {:.1}%", min_edge);
-    println!("{}\n", "=".repeat(70));
-
-    let scanner = Scanner::new(config.clone());
-    let markets = scanner.fetch_markets().await?;
-
-    let mut runner = StrategyRunner::new(config);
-    runner.no_bias = polymarket_bot::strategies::NoBiasStrategy::new(
-        polymarket_bot::config::NoBiasConfig {
-            min_edge: min_edge / 100.0,
-            ..Default::default()
-        },
-    );
-
-    let opportunities = runner.no_bias.find_opportunities(&markets);
-    print_no_bias_opportunities(&opportunities, limit);
-
-    Ok(())
-}
-
 async fn run_bot(config: &Config, interval: u64, auto_execute: Option<f64>) -> Result<()> {
     println!("\n{}", "=".repeat(70));
     println!("  CONTINUOUS MODE");
@@ -297,9 +257,6 @@ async fn run_bot(config: &Config, interval: u64, auto_execute: Option<f64>) -> R
                         }
                     }
 
-                    for opp in opportunities.no_bias.iter().take(3) {
-                        println!("  [BIAS]   {}", opp.recommendation);
-                    }
                 }
 
                 // Show exposure status
@@ -341,9 +298,6 @@ async fn show_stats(config: &Config) -> Result<()> {
     println!("  Sniper:");
     println!("    Trades: {} | Wins: {} | Win Rate: {:.1}%",
         stats.sniper_trades, stats.sniper_wins, stats.sniper_win_rate());
-    println!("  NO Bias:");
-    println!("    Trades: {} | Wins: {} | Win Rate: {:.1}%",
-        stats.no_bias_trades, stats.no_bias_wins, stats.no_bias_win_rate());
 
     // Show open positions
     let positions = db.get_open_positions().await?;
@@ -404,33 +358,3 @@ fn print_sniper_opportunities(opportunities: &[polymarket_bot::Opportunity], lim
     println!();
 }
 
-fn print_no_bias_opportunities(opportunities: &[polymarket_bot::Opportunity], limit: usize) {
-    if opportunities.is_empty() {
-        println!("No NO bias opportunities found.\n");
-        return;
-    }
-
-    println!("NO BIAS OPPORTUNITIES (longer dated)");
-    println!("{}", "-".repeat(70));
-
-    for (i, opp) in opportunities.iter().take(limit).enumerate() {
-        println!("\n{}. \"{}\"", i + 1, opp.short_question(60));
-        println!("   NO at {}c | Edge: {:.1}% vs 78.4% base rate",
-            opp.price_cents(),
-            opp.edge * 100.0
-        );
-        println!("   Liquidity: ${:.0}K | Time: {}",
-            opp.liquidity.to_string().parse::<f64>().unwrap_or(0.0) / 1000.0,
-            opp.time_display()
-        );
-        if let Some(cat) = &opp.category {
-            println!("   Category: {}", cat);
-        }
-    }
-
-    if opportunities.len() > limit {
-        println!("\n   ... and {} more", opportunities.len() - limit);
-    }
-
-    println!();
-}

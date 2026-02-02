@@ -12,16 +12,12 @@ const faqs: FAQItem[] = [
     answer: 'Resolution Sniper targets markets closing within 12 hours where the favorite has a high probability of winning. Historical data shows that at 4 hours before close, the favorite wins 95.3% of the time. The strategy profits from the gap between the favorite\'s price and this high win rate. For example, if a favorite is priced at 80¢ but wins 95% of the time, there\'s a profitable edge.'
   },
   {
-    question: 'What is the NO Bias strategy?',
-    answer: 'NO Bias exploits a structural bias in prediction markets: 78.4% of markets resolve to NO. People create markets hoping YES happens, which inflates YES prices. This strategy buys NO when it\'s undervalued relative to the historical resolution rate. If NO is priced at 35¢ but historically wins 78% of the time, that\'s a 43% edge.'
-  },
-  {
     question: 'How do I connect a wallet?',
     answer: 'Click "Connect Wallet" in the top right and connect with MetaMask, Coinbase Wallet, or WalletConnect. Your trading wallet needs USDC.e (bridged USDC) on Polygon for trading. Polymarket is gasless - you don\'t need POL in your trading wallet! You only need a small amount of POL in your main wallet to transfer USDC.e into your Polymarket trading wallet.'
   },
   {
     question: 'How often do opportunities update?',
-    answer: 'The scanner checks for new opportunities every 60 seconds. The opportunities list will automatically refresh with the latest markets matching the Sniper and NO Bias strategies. Prices and market data are fetched in real-time from Polymarket.'
+    answer: 'The scanner checks for new opportunities every 15 seconds. The opportunities list will automatically refresh with the latest markets matching the Sniper strategy. Prices and market data are fetched in real-time from Polymarket.'
   },
   {
     question: 'What does Edge mean?',
@@ -33,11 +29,11 @@ const faqs: FAQItem[] = [
   },
   {
     question: 'What does Confidence mean?',
-    answer: 'Confidence represents the estimated probability that the position will win, based on historical data and strategy-specific analysis. For Sniper, it\'s based on how often favorites win at that time before close. For NO Bias, it\'s the historical NO resolution rate (78.4%).'
+    answer: 'Confidence represents the estimated probability that the position will win, based on historical data and strategy-specific analysis. For Sniper, it\'s based on how often favorites win at that time before close.'
   },
   {
-    question: 'What do the filters (Sniper, NO Bias, Crypto, Sports) do?',
-    answer: 'Filters let you focus on specific opportunity types. Sniper shows high-probability favorites closing soon (≤12h). NO Bias shows undervalued NO positions. Crypto and Sports filter markets by category. Use the sort dropdown (funnel icon) to order by time, edge, return, or liquidity.'
+    question: 'What do the filters (Sniper, Crypto, Sports) do?',
+    answer: 'Filters let you focus on specific opportunity types. Sniper shows high-probability favorites closing soon (≤12h). Crypto and Sports filter markets by category. Use the sort dropdown (funnel icon) to order by time, edge, return, or liquidity.'
   },
   {
     question: 'Why does the "Close" time sometimes seem wrong?',

@@ -14,13 +14,13 @@ pub struct AutoTradingSettings {
     // === Auto-Buy Settings ===
     /// Enable automatic buying of opportunities
     pub auto_buy_enabled: bool,
-    /// Maximum USDC per trade
-    pub max_position_size: Decimal,
+    /// USDC amount per auto-buy trade
+    pub position_size: Decimal,
     /// Maximum total USDC exposure across all positions
     pub max_total_exposure: Decimal,
     /// Minimum edge required to buy (e.g., 0.05 = 5%)
     pub min_edge: f64,
-    /// Which strategies to auto-buy: ["sniper", "no_bias"]
+    /// Which strategies to auto-buy: ["sniper"]
     pub strategies: Vec<String>,
 
     // === Take Profit ===
@@ -54,6 +54,16 @@ pub struct AutoTradingSettings {
     pub cooldown_minutes: i32,
     /// Maximum daily loss before pausing auto-trading
     pub max_daily_loss: Decimal,
+
+    // === Dispute Sniper ===
+    /// Enable dispute sniping (auto-buy proposed outcomes with edge)
+    pub dispute_sniper_enabled: bool,
+    /// Minimum edge to trigger a dispute snipe (e.g., 0.10 = 10%)
+    pub min_dispute_edge: f64,
+    /// USDC amount per dispute snipe
+    pub dispute_position_size: Decimal,
+    /// Auto-exit if dispute escalates from Proposed to Disputed/DvmVote
+    pub dispute_exit_on_escalation: bool,
 }
 
 impl Default for AutoTradingSettings {
@@ -64,7 +74,7 @@ impl Default for AutoTradingSettings {
 
             // Auto-buy OFF by default (user must opt-in)
             auto_buy_enabled: false,
-            max_position_size: Decimal::from(50),
+            position_size: Decimal::from(50),
             max_total_exposure: Decimal::from(500),
             min_edge: 0.05,
             strategies: vec!["sniper".to_string()],
@@ -89,6 +99,12 @@ impl Default for AutoTradingSettings {
             max_positions: 10,
             cooldown_minutes: 5,
             max_daily_loss: Decimal::from(100),
+
+            // Dispute sniper
+            dispute_sniper_enabled: false,
+            min_dispute_edge: 0.10,
+            dispute_position_size: Decimal::from(25),
+            dispute_exit_on_escalation: true,
         }
     }
 }
@@ -116,7 +132,7 @@ impl AutoTradingSettings {
 pub struct UpdateSettingsRequest {
     pub enabled: Option<bool>,
     pub auto_buy_enabled: Option<bool>,
-    pub max_position_size: Option<String>,
+    pub position_size: Option<String>,
     pub max_total_exposure: Option<String>,
     pub min_edge: Option<f64>,
     pub strategies: Option<Vec<String>>,
@@ -131,4 +147,8 @@ pub struct UpdateSettingsRequest {
     pub max_positions: Option<i32>,
     pub cooldown_minutes: Option<i32>,
     pub max_daily_loss: Option<String>,
+    pub dispute_sniper_enabled: Option<bool>,
+    pub min_dispute_edge: Option<f64>,
+    pub dispute_position_size: Option<String>,
+    pub dispute_exit_on_escalation: Option<bool>,
 }

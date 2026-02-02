@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Query parameters for listing opportunities
 #[derive(Debug, Deserialize)]
 pub struct ListOpportunitiesQuery {
-    /// Filter by strategy: "sniper", "nobias", or "all" (default)
+    /// Filter by strategy: "sniper" or "all" (default)
     pub strategy: Option<String>,
     /// Maximum number to return
     pub limit: Option<usize>,
@@ -45,7 +45,6 @@ pub async fn list_opportunities(
         .filter(|opp| {
             match query.strategy.as_deref() {
                 Some("sniper") => matches!(opp.strategy, crate::types::StrategyType::ResolutionSniper),
-                Some("nobias") => matches!(opp.strategy, crate::types::StrategyType::NoBias),
                 _ => true, // "all" or no filter
             }
         })

@@ -182,7 +182,7 @@ export function useClobClient() {
     }
   }, [walletClient, address, chainId, sessionToken])
 
-  // Place a limit order using the SDK
+  // Place a limit order using the SDK (GTC - Good Till Cancelled)
   const placeOrder = useCallback(async (params: OrderParams): Promise<string | null> => {
     setIsPlacingOrder(true)
     setError(null)
@@ -223,6 +223,72 @@ export function useClobClient() {
       setIsPlacingOrder(false)
     }
   }, [initializeClient])
+
+  // Place a limit order via backend (handles L2 auth for HTTP contexts)
+  const placeLimitOrder = useCallback(async (params: OrderParams): Promise<string | null> => {
+    setIsPlacingOrder(true)
+    setError(null)
+
+    try {
+      const client = await initializeClient()
+      if (!client) {
+        return null
+      }
+
+      const creds = credsRef.current
+      if (!creds || !creds.key || !creds.secret || !creds.passphrase) {
+        throw new Error('No API credentials available. Please try reconnecting your wallet.')
+      }
+
+      console.log('Creating limit order with params:', params)
+
+      // Create the signed limit order using the SDK (this handles EIP-712 signing)
+      const signedOrder = await client.createOrder({
+        tokenID: params.tokenId,
+        side: params.side === 'buy' ? Side.BUY : Side.SELL,
+        size: params.size,
+        price: params.price,
+      })
+
+      console.log('Signed limit order created:', JSON.stringify(signedOrder, null, 2))
+
+      // Submit via backend (which handles L2 HMAC auth)
+      const response = await fetch('/api/trades/submit-order', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          signed_order: signedOrder,
+          api_key: creds.key,
+          api_secret: creds.secret,
+          api_passphrase: creds.passphrase,
+          order_type: 'GTC', // Good Till Cancelled for limit orders
+        }),
+      })
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData.error || `Submission failed: ${response.status}`)
+      }
+
+      const result = await response.json()
+      console.log('Limit order response:', result)
+
+      if (result.success || result.order_id) {
+        return result.order_id || 'submitted'
+      } else {
+        throw new Error(result.error || 'Limit order submission failed')
+      }
+    } catch (err) {
+      console.error('Limit order failed:', err)
+      setError(err instanceof Error ? err.message : 'Limit order failed')
+      return null
+    } finally {
+      setIsPlacingOrder(false)
+    }
+  }, [initializeClient, sessionToken])
 
   // Create a market order (FOK)
   // Note: Due to crypto.subtle not being available over HTTP, we create the order
@@ -476,6 +542,7 @@ export function useClobClient() {
     initializeClient,
     placeOrder,
     placeMarketOrder,
+    placeLimitOrder,
     checkAllowance,
     enableTrading,
     clearClient,

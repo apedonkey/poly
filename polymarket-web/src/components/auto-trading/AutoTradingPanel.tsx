@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Zap, Wallet, Lock, X, ShieldCheck } from 'lucide-react'
 import { useWalletStore } from '../../stores/walletStore'
@@ -9,11 +9,14 @@ import {
   disableAutoTrading,
   getAutoTradingHistory,
   getAutoTradingStats,
+  getAutoTradingStatus,
 } from '../../api/client'
 import { AutoBuySettings } from './AutoBuySettings'
 import { AutoSellSettings } from './AutoSellSettings'
+import { DisputeSniperSettings } from './DisputeSniperSettings'
 import { AutoTradingStatsCard } from './AutoTradingStatsCard'
 import { ActivityLog } from './ActivityLog'
+import { MillionairesClub } from './MillionairesClub'
 import type { AutoTradingSettings } from '../../types'
 
 // Access password for Auto-Trade section
@@ -55,6 +58,29 @@ export function AutoTradingPanel() {
     enabled: isConnected(),
     refetchInterval: 30000,
   })
+
+  // Fetch status (includes wallet balance - also updated in real-time via WebSocket)
+  const { data: statusData } = useQuery({
+    queryKey: ['auto-trading-status', sessionToken],
+    queryFn: () => getAutoTradingStatus(sessionToken!),
+    enabled: isConnected(),
+    refetchInterval: 30000,
+  })
+
+  // Real-time wallet balance from WebSocket
+  const [realtimeBalance, setRealtimeBalance] = useState<string | null>(null)
+  const walletAddress = useWalletStore((s) => s.address)
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      if (detail.address?.toLowerCase() === walletAddress?.toLowerCase()) {
+        setRealtimeBalance(detail.usdc_balance)
+      }
+    }
+    window.addEventListener('wallet-balance', handler)
+    return () => window.removeEventListener('wallet-balance', handler)
+  }, [walletAddress])
 
   // Enable mutation (requires password)
   const enableMutation = useMutation({
@@ -161,10 +187,39 @@ export function AutoTradingPanel() {
 
   if (!isConnected()) {
     return (
+      <div className="space-y-6">
+        <div className="text-center py-12">
+          <Wallet className="w-12 h-12 text-gray-600 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold mb-2">Connect Your Wallet</h3>
+          <p className="text-gray-400">Connect your wallet to configure auto-trading.</p>
+        </div>
+        <MillionairesClub />
+      </div>
+    )
+  }
+
+  // Check if using external wallet (MetaMask) - auto-trading requires generated wallet
+  const walletStore = useWalletStore.getState()
+  if (walletStore.isExternal) {
+    return (
       <div className="text-center py-12">
-        <Wallet className="w-12 h-12 text-gray-600 mx-auto mb-4" />
-        <h3 className="text-lg font-semibold mb-2">Connect Your Wallet</h3>
-        <p className="text-gray-400">Connect your wallet to configure auto-trading.</p>
+        <div className="w-16 h-16 bg-yellow-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+          <Zap className="w-8 h-8 text-yellow-500" />
+        </div>
+        <h3 className="text-lg font-semibold mb-2">Generated Wallet Required</h3>
+        <p className="text-gray-400 max-w-md mx-auto mb-4">
+          Auto-trading requires a generated wallet so the bot can sign trades automatically.
+          External wallets (MetaMask) can't be used for auto-trading because we don't have access to your private key.
+        </p>
+        <div className="bg-poly-card border border-poly-border rounded-lg p-4 max-w-md mx-auto">
+          <p className="text-sm text-gray-300 mb-3">To use auto-trading:</p>
+          <ol className="text-sm text-gray-400 text-left list-decimal list-inside space-y-1">
+            <li>Disconnect your current wallet</li>
+            <li>Click "Connect" and choose "Generate New Wallet"</li>
+            <li>Set a password and save your wallet address</li>
+            <li>Fund your new wallet with USDC</li>
+          </ol>
+        </div>
       </div>
     )
   }
@@ -176,31 +231,62 @@ export function AutoTradingPanel() {
   return (
     <div className="space-y-6">
       {/* Header with master toggle */}
-      <div className="flex items-center justify-between bg-poly-card rounded-xl border border-poly-border p-4">
-        <div className="flex items-center gap-3">
-          <Zap className={`w-6 h-6 ${settings?.enabled ? 'text-poly-green' : 'text-gray-500'}`} />
-          <div>
-            <h2 className="text-lg font-semibold">Auto-Trading</h2>
-            <p className="text-sm text-gray-400">
-              {settings?.enabled ? 'Monitoring positions for auto-sell triggers' : 'Disabled'}
-            </p>
+      <div className="bg-poly-card rounded-xl border border-poly-border p-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Zap className={`w-6 h-6 ${settings?.enabled ? 'text-poly-green' : 'text-gray-500'}`} />
+            <div>
+              <h2 className="text-lg font-semibold">Auto-Trading</h2>
+              <p className="text-sm text-gray-400">
+                {settings?.enabled ? 'Monitoring positions for auto-sell triggers' : 'Disabled'}
+              </p>
+            </div>
           </div>
+
+          {/* Master toggle */}
+          <button
+            onClick={handleToggle}
+            disabled={enableMutation.isPending || disableMutation.isPending}
+            className={`relative w-14 h-8 rounded-full transition-colors ${
+              settings?.enabled ? 'bg-poly-green' : 'bg-gray-600'
+            }`}
+          >
+            <span
+              className={`absolute top-1 left-1 w-6 h-6 bg-white rounded-full transition-transform ${
+                settings?.enabled ? 'translate-x-6' : 'translate-x-0'
+              }`}
+            />
+          </button>
         </div>
 
-        {/* Master toggle */}
-        <button
-          onClick={handleToggle}
-          disabled={enableMutation.isPending || disableMutation.isPending}
-          className={`relative w-14 h-8 rounded-full transition-colors ${
-            settings?.enabled ? 'bg-poly-green' : 'bg-gray-600'
-          }`}
-        >
-          <span
-            className={`absolute top-1 w-6 h-6 bg-white rounded-full transition-transform ${
-              settings?.enabled ? 'translate-x-7' : 'translate-x-1'
-            }`}
-          />
-        </button>
+        {/* Wallet balance & status bar */}
+        {statusData && (
+          <div className="mt-3 pt-3 border-t border-poly-border grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <p className="text-xs text-gray-500">Wallet Balance</p>
+              <p className="text-sm font-semibold text-white">
+                <Wallet className="w-3.5 h-3.5 inline mr-1 text-poly-green" />
+                ${realtimeBalance ?? statusData.wallet_balance}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Total Exposure</p>
+              <p className="text-sm font-semibold text-white">${statusData.total_exposure}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Open Positions</p>
+              <p className="text-sm font-semibold text-white">{statusData.open_positions}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Daily PnL</p>
+              <p className={`text-sm font-semibold ${
+                parseFloat(statusData.daily_pnl) >= 0 ? 'text-poly-green' : 'text-poly-red'
+              }`}>
+                ${statusData.daily_pnl}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Password Modal */}
@@ -269,11 +355,20 @@ export function AutoTradingPanel() {
           disabled={!settings?.enabled}
           isPending={updateMutation.isPending}
         />
+        <DisputeSniperSettings
+          settings={settings}
+          onUpdate={(s) => updateMutation.mutate(s)}
+          disabled={!settings?.enabled}
+          isPending={updateMutation.isPending}
+        />
         <AutoTradingStatsCard stats={statsData?.stats} />
       </div>
 
       {/* Activity log */}
       <ActivityLog history={historyData?.history || []} />
+
+      {/* Millionaires Club — observation scanner */}
+      <MillionairesClub />
     </div>
   )
 }

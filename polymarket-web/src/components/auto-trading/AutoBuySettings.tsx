@@ -39,13 +39,13 @@ export function AutoBuySettings({ settings, onUpdate, disabled, isPending }: Pro
           <button
             onClick={() => handleToggle('auto_buy_enabled', !settings?.auto_buy_enabled)}
             disabled={disabled || isPending}
-            className={`relative w-10 h-6 rounded-full transition-colors ${
+            className={`relative w-11 h-6 rounded-full transition-colors ${
               settings?.auto_buy_enabled ? 'bg-poly-green' : 'bg-gray-600'
             }`}
           >
             <span
-              className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
-                settings?.auto_buy_enabled ? 'translate-x-4' : 'translate-x-0.5'
+              className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+                settings?.auto_buy_enabled ? 'translate-x-5' : 'translate-x-0'
               }`}
             />
           </button>
@@ -73,17 +73,6 @@ export function AutoBuySettings({ settings, onUpdate, disabled, isPending }: Pro
           >
             Sniper
           </button>
-          <button
-            onClick={() => handleStrategyToggle('no_bias')}
-            disabled={disabled || isPending}
-            className={`px-3 py-1.5 rounded-lg text-sm transition ${
-              settings?.strategies?.includes('no_bias')
-                ? 'bg-poly-green/20 text-poly-green border border-poly-green'
-                : 'bg-gray-700 text-gray-400 border border-gray-600'
-            }`}
-          >
-            NO Bias
-          </button>
         </div>
       </div>
 
@@ -100,11 +89,11 @@ export function AutoBuySettings({ settings, onUpdate, disabled, isPending }: Pro
         <div className="mt-4 space-y-3 pt-4 border-t border-poly-border">
           {/* Max position size */}
           <div>
-            <label className="text-sm text-gray-400 block mb-1">Max per trade ($)</label>
+            <label className="text-sm text-gray-400 block mb-1">Trade size ($)</label>
             <input
               type="number"
-              value={settings?.max_position_size || '50'}
-              onChange={(e) => onUpdate({ max_position_size: e.target.value })}
+              value={settings?.position_size || '50'}
+              onChange={(e) => onUpdate({ position_size: e.target.value })}
               disabled={disabled || isPending}
               className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-base"
               min="1"

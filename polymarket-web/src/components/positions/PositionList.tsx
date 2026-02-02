@@ -5,6 +5,7 @@ import { useWalletStore } from '../../stores/walletStore'
 import { PositionCard } from './PositionCard'
 import { StatsCard } from './StatsCard'
 import { SellModal } from './SellModal'
+import { OpenOrdersList } from '../orders/OpenOrdersList'
 import { Wallet } from 'lucide-react'
 import type { Position } from '../../types'
 
@@ -60,6 +61,9 @@ export function PositionList() {
   return (
     <div className="space-y-6">
       {stats && <StatsCard stats={stats} />}
+
+      {/* Open Orders */}
+      <OpenOrdersList />
 
       <div>
         <h2 className="text-lg font-semibold mb-4">Your Positions</h2>

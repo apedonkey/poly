@@ -43,7 +43,7 @@ pub async fn send_alerts(
         }
     };
 
-    let webhook = DiscordWebhook::new(webhook_url.clone());
+    let _webhook = DiscordWebhook::new(webhook_url.clone());
     let mut sent = 0;
 
     for opp in &request.opportunities {

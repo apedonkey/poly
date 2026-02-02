@@ -25,6 +25,10 @@ pub enum ExitTrigger {
         hours_held: f64,
         price: Decimal,
     },
+    DisputeEscalation {
+        price: Decimal,
+        new_status: String,
+    },
 }
 
 impl ExitTrigger {
@@ -35,6 +39,7 @@ impl ExitTrigger {
             ExitTrigger::StopLoss { .. } => "stop_loss".to_string(),
             ExitTrigger::TrailingStop { .. } => "trailing_stop".to_string(),
             ExitTrigger::TimeExit { .. } => "time_exit".to_string(),
+            ExitTrigger::DisputeEscalation { .. } => "dispute_exit".to_string(),
         }
     }
 
@@ -57,6 +62,9 @@ impl ExitTrigger {
             ExitTrigger::TimeExit { hours_held, .. } => {
                 format!("Time exit after {:.1} hours", hours_held)
             }
+            ExitTrigger::DisputeEscalation { new_status, .. } => {
+                format!("Dispute escalated to {}", new_status)
+            }
         }
     }
 
@@ -67,6 +75,7 @@ impl ExitTrigger {
             ExitTrigger::StopLoss { price, .. } => *price,
             ExitTrigger::TrailingStop { price, .. } => *price,
             ExitTrigger::TimeExit { price, .. } => *price,
+            ExitTrigger::DisputeEscalation { price, .. } => *price,
         }
     }
 }
