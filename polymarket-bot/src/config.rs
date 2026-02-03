@@ -114,7 +114,7 @@ impl Default for MintMakerConfig {
             max_total_pairs: 20,
             stale_order_seconds: 120,
             assets: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string(), "XRP".to_string()],
-            rebalance_interval_seconds: 10,
+            rebalance_interval_seconds: 3,
             min_minutes_to_close: 2.0,
             max_minutes_to_close: 14.0,
         }

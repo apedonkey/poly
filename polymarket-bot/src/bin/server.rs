@@ -12,14 +12,20 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{debug, info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{debug, info};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    // Initialize logging — default to warn, show info only for trading-related modules.
+    // Override with RUST_LOG env var for full debugging, e.g. RUST_LOG=info
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,polymarket_bot::services::mint_maker::runner=info,polymarket_bot::services::mint_maker::order_manager=info,polymarket_bot::services::mint_maker::scanner=info"
+        )
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_target(false)
         .compact()
         .init();

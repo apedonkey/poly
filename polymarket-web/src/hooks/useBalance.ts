@@ -46,6 +46,7 @@ export function useBalance() {
       setBalance({
         usdc: result.usdc_balance,
         matic: result.matic_balance,
+        safe_usdc_balance: result.safe_usdc_balance,
       })
     } catch (err) {
       console.error('Failed to fetch generated wallet balance:', err)

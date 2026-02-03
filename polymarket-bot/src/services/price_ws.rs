@@ -31,6 +31,9 @@ const MAX_SPREAD: Decimal = Decimal::from_parts(40, 0, 0, false, 2); // 0.40
 pub struct PriceUpdate {
     pub token_id: String,
     pub price: String,
+    /// Best bid price from the orderbook (if available from book/price_change events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_bid: Option<String>,
 }
 
 /// Broadcast sender for price updates to WebSocket clients
@@ -274,6 +277,7 @@ impl PriceWebSocket {
                     let _ = price_tx.send(PriceUpdate {
                         token_id: asset_id.to_string(),
                         price: price.to_string(),
+                        best_bid: None,
                     });
                 }
             }
@@ -322,7 +326,7 @@ impl PriceWebSocket {
                     return;
                 }
                 let mid_price = (bid + ask) / Decimal::from(2);
-                Self::apply_price_update(asset_id, mid_price, opportunities, opportunity_tx, price_tx)
+                Self::apply_price_update(asset_id, mid_price, Some(bid), opportunities, opportunity_tx, price_tx)
                     .await;
             }
         }
@@ -411,6 +415,7 @@ impl PriceWebSocket {
             let _ = price_tx.send(PriceUpdate {
                 token_id: asset_id.to_string(),
                 price: mid_price.to_string(),
+                best_bid: best_bid.map(|b| b.to_string()),
             });
 
             debug!(
@@ -438,6 +443,7 @@ impl PriceWebSocket {
     async fn apply_price_update(
         asset_id: &str,
         mid_price: Decimal,
+        best_bid: Option<Decimal>,
         opportunities: &Arc<RwLock<Vec<Opportunity>>>,
         opportunity_tx: &broadcast::Sender<Vec<Opportunity>>,
         price_tx: &PriceUpdateTx,
@@ -485,6 +491,7 @@ impl PriceWebSocket {
         let _ = price_tx.send(PriceUpdate {
             token_id: asset_id.to_string(),
             price: mid_price.to_string(),
+            best_bid: best_bid.map(|b| b.to_string()),
         });
 
         if changed {

@@ -6,7 +6,7 @@
 use crate::config::GammaApi;
 use crate::types::TrackedMarket;
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -137,38 +137,42 @@ pub async fn fetch_15m_crypto_markets(
         }
     }
 
-    // Fetch live CLOB midpoint prices for markets currently in their 15-min window.
-    // A market is "live" when server_now >= endDate - 15 minutes.
-    let live_window = Duration::minutes(15);
-    let mut live_count = 0;
+    // Fetch CLOB midpoint prices for ALL markets (including upcoming/future ones).
+    // The CLOB accepts orders before the 15-min window opens, so midpoints are
+    // available early and give us real book prices instead of stale Gamma data.
+    let mut midpoint_count = 0;
     for market in &mut all_markets {
-        let is_live = market.end_date.map_or(false, |end| {
-            server_now >= end - live_window
-        });
-        if !is_live {
+        // Skip already-closed markets
+        let is_open = market.end_date.map_or(false, |end| server_now < end);
+        if !is_open {
             continue;
         }
-        live_count += 1;
 
         // Fetch midpoint for YES and NO tokens independently.
         // Don't derive one from the other — real book prices may not sum to 1.00.
+        let mut got_midpoint = false;
         if let Some(ref yes_token) = market.yes_token_id {
             if let Some(mid) = fetch_clob_midpoint(client, yes_token).await {
                 market.yes_price = mid;
+                got_midpoint = true;
             }
         }
         if let Some(ref no_token) = market.no_token_id {
             if let Some(mid) = fetch_clob_midpoint(client, no_token).await {
                 market.no_price = mid;
+                got_midpoint = true;
             }
+        }
+        if got_midpoint {
+            midpoint_count += 1;
         }
     }
 
     info!(
-        "MintMaker scanner: {} open 15m markets from {} events ({} live with CLOB prices)",
+        "MintMaker scanner: {} open 15m markets from {} events ({} with CLOB midpoints)",
         all_markets.len(),
         events.len(),
-        live_count,
+        midpoint_count,
     );
 
     Ok(all_markets)

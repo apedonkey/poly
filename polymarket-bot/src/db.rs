@@ -685,6 +685,7 @@ impl Database {
                 assets TEXT DEFAULT '["BTC","ETH","SOL"]',
                 min_minutes_to_close REAL DEFAULT 2.0,
                 max_minutes_to_close REAL DEFAULT 14.0,
+                balance_reserve REAL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (wallet_address) REFERENCES wallets(address)
@@ -800,6 +801,62 @@ impl Database {
             if !mm_info.is_empty() && !has_auto_redeem {
                 info!("Migrating mint_maker_settings: adding auto_redeem column");
                 sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN auto_redeem INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_stop_loss_pct = mm_info.iter().any(|(_, name, _, _, _, _)| name == "stop_loss_pct");
+            if !mm_info.is_empty() && !has_stop_loss_pct {
+                info!("Migrating mint_maker_settings: adding stop_loss_pct column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN stop_loss_pct INTEGER DEFAULT 25")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_stop_loss_delay = mm_info.iter().any(|(_, name, _, _, _, _)| name == "stop_loss_delay_secs");
+            if !mm_info.is_empty() && !has_stop_loss_delay {
+                info!("Migrating mint_maker_settings: adding stop_loss_delay_secs column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN stop_loss_delay_secs INTEGER DEFAULT 30")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_place_delay = mm_info.iter().any(|(_, name, _, _, _, _)| name == "auto_place_delay_mins");
+            if !mm_info.is_empty() && !has_place_delay {
+                info!("Migrating mint_maker_settings: adding auto_place_delay_mins column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN auto_place_delay_mins INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_auto_size_pct = mm_info.iter().any(|(_, name, _, _, _, _)| name == "auto_size_pct");
+            if !mm_info.is_empty() && !has_auto_size_pct {
+                info!("Migrating mint_maker_settings: adding auto_size_pct column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN auto_size_pct INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_auto_max_attempts = mm_info.iter().any(|(_, name, _, _, _, _)| name == "auto_max_attempts");
+            if !mm_info.is_empty() && !has_auto_max_attempts {
+                info!("Migrating mint_maker_settings: adding auto_max_attempts column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN auto_max_attempts INTEGER DEFAULT 1")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_balance_reserve = mm_info.iter().any(|(_, name, _, _, _, _)| name == "balance_reserve");
+            if !mm_info.is_empty() && !has_balance_reserve {
+                info!("Migrating mint_maker_settings: adding balance_reserve column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN balance_reserve REAL DEFAULT 0.0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_smart_mode = mm_info.iter().any(|(_, name, _, _, _, _)| name == "smart_mode");
+            if !mm_info.is_empty() && !has_smart_mode {
+                info!("Migrating mint_maker_settings: adding smart_mode column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN smart_mode INTEGER DEFAULT 0")
                     .execute(&self.pool)
                     .await?;
             }
@@ -3003,6 +3060,13 @@ impl Database {
                     auto_place_size: row.try_get::<String, _>("auto_place_size").unwrap_or_else(|_| "2".to_string()),
                     auto_max_markets: row.try_get::<i32, _>("auto_max_markets").unwrap_or(1),
                     auto_redeem: row.try_get::<i32, _>("auto_redeem").unwrap_or(0) != 0,
+                    stop_loss_pct: row.try_get::<i32, _>("stop_loss_pct").unwrap_or(25),
+                    stop_loss_delay_secs: row.try_get::<i32, _>("stop_loss_delay_secs").unwrap_or(30),
+                    auto_place_delay_mins: row.try_get::<i32, _>("auto_place_delay_mins").unwrap_or(0),
+                    auto_size_pct: row.try_get::<i32, _>("auto_size_pct").unwrap_or(0),
+                    auto_max_attempts: row.try_get::<i32, _>("auto_max_attempts").unwrap_or(1),
+                    balance_reserve: row.try_get::<f64, _>("balance_reserve").unwrap_or(0.0),
+                    smart_mode: row.try_get::<i32, _>("smart_mode").unwrap_or(0) != 0,
                 })
             }
             None => {
@@ -3024,6 +3088,13 @@ impl Database {
                     auto_place_size: "2".to_string(),
                     auto_max_markets: 1,
                     auto_redeem: false,
+                    stop_loss_pct: 25,
+                    stop_loss_delay_secs: 30,
+                    auto_place_delay_mins: 0,
+                    auto_size_pct: 0,
+                    auto_max_attempts: 1,
+                    balance_reserve: 0.0,
+                    smart_mode: false,
                 })
             }
         }
@@ -3038,8 +3109,9 @@ impl Database {
             INSERT INTO mint_maker_settings (wallet_address, enabled, preset, bid_offset_cents, max_pair_cost,
                 min_spread_profit, max_pairs_per_market, max_total_pairs, stale_order_seconds, assets,
                 min_minutes_to_close, max_minutes_to_close, auto_place, auto_place_size, auto_max_markets,
-                auto_redeem, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                auto_redeem, stop_loss_pct, stop_loss_delay_secs, auto_place_delay_mins, auto_size_pct,
+                auto_max_attempts, balance_reserve, smart_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wallet_address) DO UPDATE SET
                 enabled = excluded.enabled,
                 preset = excluded.preset,
@@ -3056,6 +3128,13 @@ impl Database {
                 auto_place_size = excluded.auto_place_size,
                 auto_max_markets = excluded.auto_max_markets,
                 auto_redeem = excluded.auto_redeem,
+                stop_loss_pct = excluded.stop_loss_pct,
+                stop_loss_delay_secs = excluded.stop_loss_delay_secs,
+                auto_place_delay_mins = excluded.auto_place_delay_mins,
+                auto_size_pct = excluded.auto_size_pct,
+                auto_max_attempts = excluded.auto_max_attempts,
+                balance_reserve = excluded.balance_reserve,
+                smart_mode = excluded.smart_mode,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -3075,6 +3154,13 @@ impl Database {
         .bind(&settings.auto_place_size)
         .bind(settings.auto_max_markets)
         .bind(settings.auto_redeem as i32)
+        .bind(settings.stop_loss_pct)
+        .bind(settings.stop_loss_delay_secs)
+        .bind(settings.auto_place_delay_mins)
+        .bind(settings.auto_size_pct)
+        .bind(settings.auto_max_attempts)
+        .bind(settings.balance_reserve)
+        .bind(settings.smart_mode as i32)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -3241,6 +3327,21 @@ impl Database {
     }
 
     /// Get open pairs for a wallet (Pending, HalfFilled, Matched, Merging, Orphaned, StopLoss)
+    /// Get token IDs from all half-filled pairs (across all wallets) for price WebSocket subscription
+    pub async fn get_mint_maker_half_filled_token_ids(&self) -> Result<Vec<(Option<String>, Option<String>)>> {
+        let rows = sqlx::query(
+            "SELECT yes_token_id, no_token_id FROM mint_maker_pairs WHERE status = 'HalfFilled'"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(|r| {
+            let yes: Option<String> = r.try_get("yes_token_id").unwrap_or(None);
+            let no: Option<String> = r.try_get("no_token_id").unwrap_or(None);
+            (yes, no)
+        }).collect())
+    }
+
     pub async fn get_mint_maker_open_pairs(&self, wallet_address: &str) -> Result<Vec<MintMakerPairRow>> {
         let rows = sqlx::query(
             "SELECT * FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled', 'Matched', 'Merging', 'Orphaned', 'StopLoss') ORDER BY created_at DESC"
@@ -3290,6 +3391,18 @@ impl Database {
         Ok(count.0)
     }
 
+    /// Count ALL pairs ever placed for a market (regardless of status)
+    pub async fn count_mint_maker_all_pairs_for_market(&self, wallet_address: &str, market_id: &str) -> Result<i64> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ?"
+        )
+        .bind(wallet_address.to_lowercase())
+        .bind(market_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.0)
+    }
+
     /// Count total open pairs for a wallet
     pub async fn count_mint_maker_total_open_pairs(&self, wallet_address: &str) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
@@ -3305,7 +3418,7 @@ impl Database {
     pub async fn get_mint_maker_stale_pairs(&self, wallet_address: &str, stale_seconds: i64) -> Result<Vec<MintMakerPairRow>> {
         let cutoff = (Utc::now() - Duration::seconds(stale_seconds)).to_rfc3339();
         let rows = sqlx::query(
-            "SELECT * FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled') AND created_at < ?"
+            "SELECT * FROM mint_maker_pairs WHERE wallet_address = ? AND status = 'Pending' AND created_at < ?"
         )
         .bind(wallet_address.to_lowercase())
         .bind(&cutoff)
@@ -3327,10 +3440,43 @@ impl Database {
         Ok(rows.iter().map(Self::row_to_mm_pair).collect())
     }
 
+    /// Get recent fill rate for a specific asset (for smart mode feedback).
+    /// Returns (total_pairs, filled_pairs) from the last N hours.
+    pub async fn get_mint_maker_asset_fill_rate(&self, wallet_address: &str, asset: &str, hours: i64) -> Result<(i64, i64)> {
+        let cutoff = (Utc::now() - Duration::hours(hours)).to_rfc3339();
+        let row: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status IN ('Matched', 'Merged', 'Merging', 'Redeemed', 'MergeFailed') THEN 1 ELSE 0 END) as filled
+            FROM mint_maker_pairs
+            WHERE wallet_address = ? AND asset = ? AND created_at > ?
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .bind(asset)
+        .bind(&cutoff)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0, 0));
+
+        Ok(row)
+    }
+
     /// Get wallets with mint maker enabled
     pub async fn get_mint_maker_enabled_wallets(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT wallet_address FROM mint_maker_settings WHERE enabled = 1"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(a,)| a).collect())
+    }
+
+    /// Get wallets that have open mint maker pairs (for stop loss even when disabled)
+    pub async fn get_mint_maker_wallets_with_open_pairs(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT wallet_address FROM mint_maker_pairs WHERE status IN ('Pending', 'HalfFilled', 'Matched', 'Merging', 'Orphaned', 'StopLoss')"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -3492,6 +3638,13 @@ pub struct MintMakerSettingsRow {
     pub auto_place_size: String,
     pub auto_max_markets: i32,
     pub auto_redeem: bool,
+    pub stop_loss_pct: i32,
+    pub stop_loss_delay_secs: i32,
+    pub auto_place_delay_mins: i32,
+    pub auto_size_pct: i32,
+    pub auto_max_attempts: i32,
+    pub balance_reserve: f64,
+    pub smart_mode: bool,
 }
 
 /// Mint Maker log entry

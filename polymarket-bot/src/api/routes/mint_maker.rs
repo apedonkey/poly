@@ -80,6 +80,13 @@ pub struct UpdateSettingsRequest {
     pub auto_place_size: Option<String>,
     pub auto_max_markets: Option<i32>,
     pub auto_redeem: Option<bool>,
+    pub stop_loss_pct: Option<i32>,
+    pub stop_loss_delay_secs: Option<i32>,
+    pub auto_place_delay_mins: Option<i32>,
+    pub auto_size_pct: Option<i32>,
+    pub auto_max_attempts: Option<i32>,
+    pub balance_reserve: Option<f64>,
+    pub smart_mode: Option<bool>,
 }
 
 pub async fn update_settings(
@@ -110,6 +117,13 @@ pub async fn update_settings(
     if let Some(ref v) = req.auto_place_size { settings.auto_place_size = v.clone(); }
     if let Some(v) = req.auto_max_markets { settings.auto_max_markets = v; }
     if let Some(v) = req.auto_redeem { settings.auto_redeem = v; }
+    if let Some(v) = req.stop_loss_pct { settings.stop_loss_pct = v; }
+    if let Some(v) = req.stop_loss_delay_secs { settings.stop_loss_delay_secs = v; }
+    if let Some(v) = req.auto_place_delay_mins { settings.auto_place_delay_mins = v; }
+    if let Some(v) = req.auto_size_pct { settings.auto_size_pct = v; }
+    if let Some(v) = req.auto_max_attempts { settings.auto_max_attempts = v; }
+    if let Some(v) = req.balance_reserve { settings.balance_reserve = v; }
+    if let Some(v) = req.smart_mode { settings.smart_mode = v; }
     if let Some(p) = &req.preset { settings.preset = p.clone(); }
 
     state.db.upsert_mint_maker_settings(&settings).await

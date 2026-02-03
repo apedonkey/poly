@@ -280,6 +280,13 @@ export interface MintMakerSettings {
   auto_place_size: string
   auto_max_markets: number
   auto_redeem: boolean
+  stop_loss_pct: number
+  stop_loss_delay_secs: number
+  auto_place_delay_mins: number
+  auto_size_pct: number
+  auto_max_attempts: number
+  balance_reserve: number
+  smart_mode: boolean
 }
 
 export interface MintMakerMarketStatus {

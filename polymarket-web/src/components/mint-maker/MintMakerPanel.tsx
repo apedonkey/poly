@@ -86,6 +86,11 @@ export function MintMakerPanel() {
     } catch (_) { /* ignore */ }
   }, [sessionToken])
 
+  // Fetch settings on mount so they're visible even before enabling
+  useEffect(() => {
+    if (sessionToken) refreshSettings()
+  }, [sessionToken, refreshSettings])
+
   // Prefer localSettings (from API) over WS status — WS can lag after enable/disable
   const isEnabled = localSettings !== null ? localSettings.enabled : (status?.enabled ?? false)
 
@@ -246,7 +251,7 @@ export function MintMakerPanel() {
 
         {/* Settings */}
         {settings && (
-          <MintMakerSettingsPanel settings={settings} onUpdate={refreshSettings} />
+          <MintMakerSettingsPanel settings={settings} onUpdate={refreshSettings} activeMarkets={status?.active_markets || []} />
         )}
       </div>
 

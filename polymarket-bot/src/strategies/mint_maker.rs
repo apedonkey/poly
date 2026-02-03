@@ -108,7 +108,9 @@ impl MintMakerStrategy {
         patterns.iter().any(|p| q.contains(p))
     }
 
-    /// Calculate bid prices for a market.
+    /// Calculate bid prices for a market using cheap-side logic.
+    /// Bids the cheap side at (cheap_price - offset), derives the expensive
+    /// side from max_pair_cost so total cost is controlled.
     /// Returns (yes_bid, no_bid) if the pair is profitable.
     pub fn calculate_bids(
         &self,
@@ -116,24 +118,36 @@ impl MintMakerStrategy {
         _user_size: Decimal,
     ) -> Option<(Decimal, Decimal)> {
         let offset = Decimal::from(self.config.bid_offset_cents) / Decimal::from(100);
+        let max_cost = Decimal::from_str(&format!("{:.4}", self.config.max_pair_cost)).unwrap_or(Decimal::from_str("0.98").unwrap());
 
-        // Bid below current price
-        let yes_bid = market.yes_price - offset;
-        let no_bid = market.no_price - offset;
+        let yes_is_cheap = market.yes_price <= market.no_price;
+        let (cheap_current, expensive_current) = if yes_is_cheap {
+            (market.yes_price, market.no_price)
+        } else {
+            (market.no_price, market.yes_price)
+        };
+
+        let cheap_bid = cheap_current - offset;
+        let expensive_bid = max_cost - cheap_bid;
 
         // Validate bids are positive
-        if yes_bid <= Decimal::ZERO || no_bid <= Decimal::ZERO {
+        if cheap_bid <= Decimal::ZERO || expensive_bid <= Decimal::ZERO {
             return None;
         }
 
-        // Validate pair cost
-        let pair_cost = yes_bid + no_bid;
-        let max_cost = Decimal::from_str(&format!("{:.4}", self.config.max_pair_cost)).unwrap_or(Decimal::from_str("0.98").unwrap());
-        if pair_cost > max_cost {
+        // Don't bid at or above current price on the expensive side
+        if expensive_bid >= expensive_current {
             return None;
         }
+
+        let (yes_bid, no_bid) = if yes_is_cheap {
+            (cheap_bid, expensive_bid)
+        } else {
+            (expensive_bid, cheap_bid)
+        };
 
         // Calculate profit (payout is always $1.00 per pair)
+        let pair_cost = yes_bid + no_bid;
         let profit = Decimal::ONE - pair_cost;
         let min_profit = Decimal::from_str(&format!("{:.4}", self.config.min_spread_profit)).unwrap_or(Decimal::from_str("0.01").unwrap());
         if profit < min_profit {
