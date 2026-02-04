@@ -3232,6 +3232,35 @@ impl Database {
         Ok(())
     }
 
+    /// Update pair status, pair_cost, and profit on redeem
+    pub async fn update_mint_maker_pair_redeem(
+        &self,
+        pair_id: i64,
+        status: &str,
+        pair_cost: Option<&str>,
+        profit: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE mint_maker_pairs SET
+                status = ?,
+                pair_cost = COALESCE(?, pair_cost),
+                profit = COALESCE(?, profit),
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status)
+        .bind(pair_cost)
+        .bind(profit)
+        .bind(&now)
+        .bind(pair_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Set the stop loss sell order ID on a pair
     pub async fn set_mint_maker_stop_loss_order(&self, pair_id: i64, order_id: &str, status: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -3412,6 +3441,41 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(count.0)
+    }
+
+    /// Count pairs with unfilled orders (Pending/HalfFilled only) for a market.
+    /// Matched/Merging pairs are done with the order book and shouldn't block new placements.
+    pub async fn count_mint_maker_unfilled_pairs_for_market(&self, wallet_address: &str, market_id: &str) -> Result<i64> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status IN ('Pending', 'HalfFilled')"
+        )
+        .bind(wallet_address.to_lowercase())
+        .bind(market_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.0)
+    }
+
+    /// Count total pairs with unfilled orders (Pending/HalfFilled only) across all markets.
+    pub async fn count_mint_maker_total_unfilled_pairs(&self, wallet_address: &str) -> Result<i64> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled')"
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.0)
+    }
+
+    /// Sum shares from Matched/Merging pairs — capital that will return from merges ($1/share).
+    pub async fn sum_mint_maker_merging_capital(&self, wallet_address: &str) -> Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(CAST(size AS REAL)), 0.0) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Matched', 'Merging')"
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
     }
 
     /// Get stale pairs (older than threshold seconds, still pending/half-filled)

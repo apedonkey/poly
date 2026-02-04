@@ -242,7 +242,6 @@ export function MintMakerSettingsPanel({ settings, onUpdate, activeMarkets }: Pr
             </div>
             <NumField value={settings.auto_max_attempts} field="auto_max_attempts" parse={parseInt0} onUpdate={onUpdate} min={1} max={20} className="shrink-0 w-16" />
           </div>
-          {!settings.smart_mode && (
             <div className="flex items-center justify-between gap-4">
               <div>
                 <div className="text-gray-400">Wait before buying</div>
@@ -253,7 +252,6 @@ export function MintMakerSettingsPanel({ settings, onUpdate, activeMarkets }: Pr
                 <span className="text-gray-500">min</span>
               </div>
             </div>
-          )}
           {settings.smart_mode && (
             <div className="text-xs text-gray-500 italic pt-1">
               Offset, pair cost, and limits auto-calculated each cycle

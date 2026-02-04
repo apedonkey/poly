@@ -519,31 +519,55 @@ impl MintMakerRunner {
                 };
                 // Subtract reserve from available balance
                 let reserve = Decimal::from_str(&format!("{:.2}", settings.balance_reserve)).unwrap_or(Decimal::ZERO);
-                let available = safe_balance - reserve;
-                if available <= Decimal::ZERO {
+                let on_chain_available = safe_balance - reserve;
+                if on_chain_available <= Decimal::ZERO {
                     info!("MintMaker: Balance ${} <= reserve ${}, skipping placement", safe_balance, reserve);
                     // Fall through — remaining_balance of 0 will cause all pairs to be skipped
                 }
-                let mut remaining_balance = if available > Decimal::ZERO { available } else { Decimal::ZERO };
+
+                // Virtual balance: Matched/Merging pairs will return $1/share on merge.
+                // Count this as available capital so the budget isn't starved while merges are in-flight.
+                let merging_capital = Decimal::from_str(
+                    &format!("{:.4}", self.db.sum_mint_maker_merging_capital(wallet_address).await.unwrap_or(0.0))
+                ).unwrap_or(Decimal::ZERO);
+                let available = if merging_capital > Decimal::ZERO {
+                    info!("MintMaker: Virtual balance: on-chain=${} + merging=${} = ${}",
+                        on_chain_available, merging_capital, on_chain_available + merging_capital);
+                    on_chain_available + merging_capital
+                } else {
+                    on_chain_available
+                };
+
+                let mut remaining_balance = if on_chain_available > Decimal::ZERO { on_chain_available } else { Decimal::ZERO };
 
                 // USD per side: either balance-based (auto_size_pct > 0) or fixed
+                // In smart mode, divide by actual selected assets (not max_markets) to avoid
+                // wasting budget on assets that aren't selected.
+                let num_selected_assets_i32 = settings.assets.len() as i32;
+                let budget_divisor = if settings.smart_mode {
+                    std::cmp::min(settings.auto_max_markets, num_selected_assets_i32).max(1)
+                } else {
+                    settings.auto_max_markets
+                };
                 let usd_per_side_raw = if settings.auto_size_pct > 0 {
                     let pct = Decimal::from(settings.auto_size_pct) / Decimal::from(100);
                     let capital = available * pct;
-                    let per_market = capital / Decimal::from(settings.auto_max_markets);
+                    let per_market = capital / Decimal::from(budget_divisor);
                     per_market / Decimal::from(2) // split per side
                 } else {
                     Decimal::from_str(&settings.auto_place_size).unwrap_or(Decimal::from(2))
                 };
 
+                // Only count Pending/HalfFilled as "open" — Matched/Merging pairs
+                // are done with the order book and shouldn't block new placements.
                 let mut total_open = self
                     .db
-                    .count_mint_maker_total_open_pairs(wallet_address)
+                    .count_mint_maker_total_unfilled_pairs(wallet_address)
                     .await
                     .unwrap_or(0);
 
                 // Smart mode: compute derived settings dynamically
-                let num_selected_assets = settings.assets.len() as i32;
+                let num_selected_assets = num_selected_assets_i32;
                 let smart_min_profit = Decimal::from_str(&format!("{:.4}", settings.min_spread_profit)).unwrap_or(Decimal::from_str("0.01").unwrap());
                 let smart_max_cost = Decimal::ONE - smart_min_profit;
                 let smart_max_price = std::cmp::max(
@@ -566,14 +590,14 @@ impl MintMakerRunner {
                 };
 
                 // Use smart overrides or stored settings
-                let effective_delay_mins = if settings.smart_mode { 2.0 } else { settings.auto_place_delay_mins as f64 };
+                let effective_delay_mins = settings.auto_place_delay_mins as f64;
                 let effective_max_pairs_per_market = if settings.smart_mode { smart_pairs_per_market } else { settings.max_pairs_per_market };
                 let effective_max_total_pairs = if settings.smart_mode { smart_total_pairs } else { settings.max_total_pairs };
 
                 if settings.smart_mode {
                     info!(
-                        "MintMaker: SMART MODE — max_cost={} pairs/mkt={} total={} delay=2m",
-                        smart_max_cost, smart_pairs_per_market, smart_total_pairs
+                        "MintMaker: SMART MODE — max_cost={} pairs/mkt={} total={} delay={}m",
+                        smart_max_cost, smart_pairs_per_market, smart_total_pairs, effective_delay_mins
                     );
                 }
 
@@ -584,17 +608,20 @@ impl MintMakerRunner {
                 let place_cutoff = 15.0 - delay_mins;
                 // Markets past the delay cutoff that still have capacity for more pairs.
                 // We allow 1 new pair per market per cycle (natural 30s cooldown).
-                // Smart mode: don't bid on markets with less than 2 minutes left
-                let min_time = if settings.smart_mode { 2.0 } else { 0.0 };
+                // Never bid on markets with less than 5 minutes left — not enough
+                // time for both sides to fill before close. Manual mode uses 1 minute.
+                let min_time = if settings.smart_mode { 5.0 } else { 1.0 };
 
                 let mut placeable_markets: Vec<&MintMakerMarket> = Vec::new();
                 for m in &eligible_markets {
                     if m.minutes_to_close > place_cutoff || m.minutes_to_close <= min_time {
                         continue;
                     }
+                    // Only count Pending/HalfFilled — Matched/Merging are done filling
+                    // and shouldn't block new pair placement.
                     let market_pairs = self
                         .db
-                        .count_mint_maker_open_pairs_for_market(wallet_address, &m.market_id)
+                        .count_mint_maker_unfilled_pairs_for_market(wallet_address, &m.market_id)
                         .await
                         .unwrap_or(0);
                     if market_pairs >= effective_max_pairs_per_market as i64 {
@@ -785,14 +812,23 @@ impl MintMakerRunner {
                     }
 
                     // Don't bid at or above current price on the expensive side
-                    // (would cross the spread and taker-fill immediately)
-                    if expensive_bid >= expensive_current {
+                    // (would cross the spread and taker-fill immediately).
+                    // Instead of skipping, cap at current - 1¢ which gives better profit.
+                    let expensive_bid = if expensive_bid >= expensive_current {
+                        let capped = expensive_current - Decimal::from_str("0.01").unwrap();
+                        if capped <= Decimal::ZERO {
+                            info!("MintMaker: SKIP {} — can't cap expensive bid (current={})", market.asset, expensive_current);
+                            break 'pairs;
+                        }
                         info!(
-                            "MintMaker: SKIP {} — expensive bid {}c >= current {}c (lower max_pair_cost or raise offset)",
-                            market.asset, expensive_bid, expensive_current
+                            "MintMaker: {} expensive bid {}¢ capped to {}¢ (was >= current {}¢)",
+                            market.asset, expensive_bid * Decimal::from(100),
+                            capped * Decimal::from(100), expensive_current * Decimal::from(100)
                         );
-                        break 'pairs;
-                    }
+                        capped
+                    } else {
+                        expensive_bid
+                    };
 
                     let (yes_price, no_price) = if yes_is_cheap {
                         (cheap_bid, expensive_bid)
@@ -1657,9 +1693,64 @@ impl MintMakerRunner {
                         &pair.condition_id[..10], tx_id
                     );
 
-                    // Update ALL pairs for this condition_id to Redeemed
+                    // Determine winning outcome for PnL calculation on half-filled pairs
+                    let winning_outcome = get_winning_outcome(&self.client, &pair.condition_id).await;
+
+                    // Update ALL pairs for this condition_id to Redeemed with PnL
                     for p in pairs.iter().filter(|p| p.condition_id == pair.condition_id) {
-                        let _ = self.db.update_mint_maker_pair_status(p.id, "Redeemed").await;
+                        let yes_filled = p.yes_fill_price.is_some();
+                        let no_filled = p.no_fill_price.is_some();
+                        let size: f64 = p.size.parse().unwrap_or(0.0);
+
+                        let (pair_cost_str, profit_str) = if yes_filled && no_filled {
+                            // Both sides filled — profit already calculated by merge logic
+                            (p.pair_cost.clone(), p.profit.clone())
+                        } else if let Some(winner) = winning_outcome {
+                            // Half-filled: calculate PnL based on which side won
+                            if yes_filled {
+                                let fill: f64 = p.yes_fill_price.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                                let cost = fill * size;
+                                if winner == 0 {
+                                    // YES won — we get $1 per share
+                                    let pnl = (1.0 - fill) * size;
+                                    info!("MintMaker redeem: pair {} YES filled@{} WON → +${:.2}", p.id, fill, pnl);
+                                    (Some(format!("{:.6}", cost)), Some(format!("{:.6}", pnl)))
+                                } else {
+                                    // NO won — YES shares worth $0
+                                    let pnl = -cost;
+                                    info!("MintMaker redeem: pair {} YES filled@{} LOST → -${:.2}", p.id, fill, cost);
+                                    (Some(format!("{:.6}", cost)), Some(format!("{:.6}", pnl)))
+                                }
+                            } else if no_filled {
+                                let fill: f64 = p.no_fill_price.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                                let cost = fill * size;
+                                if winner == 1 {
+                                    // NO won — we get $1 per share
+                                    let pnl = (1.0 - fill) * size;
+                                    info!("MintMaker redeem: pair {} NO filled@{} WON → +${:.2}", p.id, fill, pnl);
+                                    (Some(format!("{:.6}", cost)), Some(format!("{:.6}", pnl)))
+                                } else {
+                                    // YES won — NO shares worth $0
+                                    let pnl = -cost;
+                                    info!("MintMaker redeem: pair {} NO filled@{} LOST → -${:.2}", p.id, fill, cost);
+                                    (Some(format!("{:.6}", cost)), Some(format!("{:.6}", pnl)))
+                                }
+                            } else {
+                                // Neither side filled — no cost, no PnL
+                                (None, Some("0".to_string()))
+                            }
+                        } else {
+                            // Couldn't determine winner — leave PnL blank
+                            warn!("MintMaker redeem: pair {} — couldn't determine winning outcome", p.id);
+                            (p.pair_cost.clone(), p.profit.clone())
+                        };
+
+                        let _ = self.db.update_mint_maker_pair_redeem(
+                            p.id, "Redeemed",
+                            pair_cost_str.as_deref(),
+                            profit_str.as_deref(),
+                        ).await;
+                        let profit_display = profit_str.as_deref().unwrap_or("?");
                         let _ = self.db.log_mint_maker_action(
                             wallet_address,
                             "auto_redeem",
@@ -1668,10 +1759,10 @@ impl MintMakerRunner {
                             Some(&p.asset),
                             None,
                             None,
-                            p.pair_cost.as_deref(),
-                            None,
+                            pair_cost_str.as_deref(),
+                            profit_str.as_deref(),
                             Some(&p.size),
-                            Some(&format!("tx: {}", tx_id)),
+                            Some(&format!("tx: {} pnl: {}", tx_id, profit_display)),
                         ).await;
                     }
                 }
@@ -1692,6 +1783,49 @@ impl MintMakerRunner {
         }
 
         Ok(())
+    }
+}
+
+/// Query which outcome index won for a resolved condition.
+///
+/// Calls `payoutNumerators(bytes32,uint256)` on the CTF contract for index 0 (YES).
+/// Returns Some(0) if YES won, Some(1) if NO won, None on error.
+async fn get_winning_outcome(client: &reqwest::Client, condition_id: &str) -> Option<u8> {
+    const CTF_ADDRESS: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+    // payoutNumerators(bytes32,uint256) selector = 0x6d7e40e3
+    const SELECTOR: &str = "6d7e40e3";
+    const RPC_URL: &str = "https://polygon-rpc.com";
+
+    let cond_hex = condition_id.strip_prefix("0x").unwrap_or(condition_id);
+    if cond_hex.len() != 64 {
+        return None;
+    }
+
+    // Query index 0 (YES outcome)
+    let index_hex = format!("{:064x}", 0u64);
+    let calldata = format!("0x{}{}{}", SELECTOR, cond_hex, index_hex);
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": CTF_ADDRESS, "data": calldata}, "latest"],
+        "id": 1
+    });
+
+    match client.post(RPC_URL).json(&payload).send().await {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                if let Some(result) = data.get("result").and_then(|v| v.as_str()) {
+                    let val = u64::from_str_radix(result.trim_start_matches("0x"), 16).unwrap_or(0);
+                    // If YES payout > 0, YES won (index 0). Otherwise NO won (index 1).
+                    return Some(if val > 0 { 0 } else { 1 });
+                }
+            }
+            None
+        }
+        Err(e) => {
+            debug!("payoutNumerators RPC error for {}: {}", &condition_id[..10], e);
+            None
+        }
     }
 }
 
