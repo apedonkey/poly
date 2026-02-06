@@ -295,6 +295,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/mint-maker/disable", post(routes::mint_maker::disable))
         .route("/mint-maker/pairs", get(routes::mint_maker::get_pairs))
         .route("/mint-maker/stats", get(routes::mint_maker::get_stats))
+        .route("/mint-maker/analytics", get(routes::mint_maker::get_analytics))
         .route("/mint-maker/log", get(routes::mint_maker::get_log))
         .route("/mint-maker/place", post(routes::mint_maker::place_pair))
         .route("/mint-maker/cancel-pair", post(routes::mint_maker::cancel_pair))

@@ -360,9 +360,23 @@ async fn check_order_status_once(
             &order_id[..16.min(order_id.len())], status, size_matched, original_size, price
         );
 
-        // CLOB sometimes returns status=MATCHED with size_matched=0.
-        // Don't treat this as filled — require actual matched size > 0.
-        let fill_status = if matched > 0.0 && (status == "MATCHED" || matched >= original * 0.99) {
+        // Check terminal statuses FIRST — INVALID/CANCELED are final even with partial fills.
+        // Note: CLOB uses American spelling "CANCELED" (one L), not "CANCELLED" (two L's).
+        let is_terminal = status == "CANCELLED" || status == "CANCELED" || status == "INVALID" || status == "CANCELED_MARKET_RESOLVED";
+        let fill_status = if is_terminal {
+            if matched > 0.0 {
+                // Partial fill on a terminal order — some shares matched but the rest never will.
+                warn!("CLOB order {} status={} with partial fill {}/{} — treating as Cancelled",
+                    &order_id[..16.min(order_id.len())], status, size_matched, original_size);
+            } else if status != "CANCELLED" && status != "CANCELED" {
+                info!("CLOB order {} terminal status={} — treating as Cancelled", &order_id[..16.min(order_id.len())], status);
+            }
+            FillStatus::Cancelled
+        } else if status == "UNKNOWN" && original == 0.0 && matched == 0.0 {
+            // CLOB returned no data for this order — it was never created or already purged.
+            warn!("CLOB order {} status=UNKNOWN with no size/price — treating as Cancelled", &order_id[..16.min(order_id.len())]);
+            FillStatus::Cancelled
+        } else if matched > 0.0 && (status == "MATCHED" || matched >= original * 0.99) {
             FillStatus::Filled
         } else if status == "MATCHED" && matched == 0.0 {
             // CLOB says MATCHED but no size — likely API lag or phantom match.
@@ -371,8 +385,6 @@ async fn check_order_status_once(
             FillStatus::Open
         } else if matched > 0.0 {
             FillStatus::PartiallyFilled
-        } else if status == "CANCELLED" {
-            FillStatus::Cancelled
         } else {
             FillStatus::Open
         };

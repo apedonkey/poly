@@ -1,0 +1,14 @@
+
+TRADE ANALYSIS FOR 0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d
+=============================================================
+
+Total trades: 3500
+Date range: 2026-02-05T05:12:49.000Z to 2026-02-05T10:36:51.000Z
+
+Buys: 3500 (72041.01 shares, $37813.69)
+Sells: 0 (0.00 shares, $0.00)
+
+Unique markets: 58
+Paired (YES+NO): 58
+YES only: 0
+NO only: 0

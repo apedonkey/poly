@@ -252,11 +252,39 @@ export function MintMakerSettingsPanel({ settings, onUpdate, activeMarkets }: Pr
                 <span className="text-gray-500">min</span>
               </div>
             </div>
+          <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="text-gray-400">Pre-place next window</div>
+                <div className="text-gray-600">Queue orders on the upcoming market for early fills</div>
+              </div>
+              <button
+                onClick={() => updateField('pre_place', !settings.pre_place)}
+                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                  settings.pre_place ? 'bg-poly-green text-white' : 'bg-poly-dark text-gray-500 border border-poly-border hover:text-gray-300'
+                }`}
+              >{settings.pre_place ? 'On' : 'Off'}</button>
+            </div>
+          <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="text-gray-400">Stop after profit</div>
+                <div className="text-gray-600">1 pair at a time — stop market on merge, retry on orphan</div>
+              </div>
+              <button
+                onClick={() => updateField('stop_after_profit', !settings.stop_after_profit)}
+                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                  settings.stop_after_profit ? 'bg-poly-green text-white' : 'bg-poly-dark text-gray-500 border border-poly-border hover:text-gray-300'
+                }`}
+              >{settings.stop_after_profit ? 'On' : 'Off'}</button>
+            </div>
           {settings.smart_mode && (
             <div className="text-xs text-gray-500 italic pt-1">
               Offset, pair cost, and limits auto-calculated each cycle
             </div>
           )}
+
+          <div className="text-xs text-green-600/80 italic pt-2">
+            Momentum filter active: only enters 60/40+ markets with orderbook depth confirmation
+          </div>
         </div>
         {(() => {
           if (settings.auto_size_pct <= 0) return null

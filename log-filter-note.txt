@@ -1,0 +1,21 @@
+Log Filtering Note
+==================
+
+The server logging was changed to reduce noise. By default, only trading-related
+modules log at INFO level. Everything else is set to WARN.
+
+Modules showing INFO logs:
+- polymarket_bot::services::mint_maker::runner (placements, fills, stop losses, cancellations)
+- polymarket_bot::services::mint_maker::order_manager (order placement/cancellation results)
+- polymarket_bot::services::mint_maker::scanner (market scan summaries)
+
+To restore full logging, set the RUST_LOG environment variable before starting:
+
+    set RUST_LOG=info
+    cargo run --bin server
+
+Or for debug-level:
+
+    set RUST_LOG=debug
+
+The filter is configured in: polymarket-bot/src/bin/server.rs (logging init block)

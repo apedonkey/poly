@@ -287,6 +287,10 @@ export interface MintMakerSettings {
   auto_max_attempts: number
   balance_reserve: number
   smart_mode: boolean
+  pre_place: boolean
+  stop_after_profit: boolean
+  momentum_threshold: number
+  depth_check: boolean
 }
 
 export interface MintMakerMarketStatus {

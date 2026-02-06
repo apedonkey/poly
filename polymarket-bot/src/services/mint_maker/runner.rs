@@ -10,6 +10,7 @@ use crate::strategies::MintMakerStrategy;
 use crate::types::MintMakerMarket;
 use alloy::signers::{local::PrivateKeySigner, Signer};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -40,6 +41,8 @@ pub struct MintMakerRunner {
     activated_wallets: Mutex<HashSet<String>>,
     /// Merge attempt tracker: pair_id -> (attempt_count, last_attempt_time)
     merge_tracker: Mutex<HashMap<i64, (u32, Instant)>>,
+    /// Relay rate-limit backoff: skip all relay ops (merge/redeem) until this time
+    relay_backoff_until: Mutex<Option<chrono::DateTime<Utc>>>,
 }
 
 impl MintMakerRunner {
@@ -93,7 +96,75 @@ impl MintMakerRunner {
             mm_live_tokens,
             activated_wallets: Mutex::new(HashSet::new()),
             merge_tracker: Mutex::new(HashMap::new()),
+            relay_backoff_until: Mutex::new(None),
         }
+    }
+
+    /// Check if relay operations are currently backed off due to a 429
+    /// Checks both in-memory state and DB (for persistence across restarts)
+    async fn is_relay_backed_off(&self, wallet_address: &str) -> bool {
+        // First check in-memory (fast path)
+        let guard = self.relay_backoff_until.lock().await;
+        if let Some(until) = *guard {
+            if Utc::now() < until {
+                let secs_left = (until - Utc::now()).num_seconds();
+                if secs_left % 60 < 4 {
+                    info!("MintMaker: Relay backed off for {}s more (until {})", secs_left, until.format("%H:%M:%S"));
+                }
+                return true;
+            } else {
+                info!("MintMaker: Relay backoff expired, resuming relay operations");
+                // Clear DB backoff too
+                let _ = self.db.set_mint_maker_relay_backoff(wallet_address, None).await;
+                return false;
+            }
+        }
+        drop(guard);
+
+        // Check DB for persisted backoff (handles restart case)
+        if let Ok(settings) = self.db.get_mint_maker_settings(wallet_address).await {
+            if let Some(backoff_str) = settings.relay_backoff_until {
+                if let Ok(until) = chrono::DateTime::parse_from_rfc3339(&backoff_str) {
+                    let until = until.with_timezone(&Utc);
+                    if Utc::now() < until {
+                        let secs_left = (until - Utc::now()).num_seconds();
+                        info!("MintMaker: Relay backed off (from DB) for {}s more", secs_left);
+                        // Sync to memory
+                        *self.relay_backoff_until.lock().await = Some(until);
+                        return true;
+                    } else {
+                        // Expired, clear from DB
+                        let _ = self.db.set_mint_maker_relay_backoff(wallet_address, None).await;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Set relay backoff after receiving a 429 response
+    /// Persists to both memory (fast) and DB (survives restart)
+    async fn set_relay_backoff(&self, wallet_address: &str, seconds: u64) {
+        let until = Utc::now() + chrono::Duration::seconds(seconds as i64);
+        warn!("MintMaker: Relay 429 — backing off for {}s (until {})", seconds, until.format("%H:%M:%S"));
+        *self.relay_backoff_until.lock().await = Some(until);
+        // Persist to DB
+        let _ = self.db.set_mint_maker_relay_backoff(wallet_address, Some(&until.to_rfc3339())).await;
+    }
+
+    /// Parse "resets in N seconds" from a relay 429 error message, returns seconds or a default
+    fn parse_relay_backoff_seconds(error_msg: &str) -> u64 {
+        // Look for patterns like "resets in 28753 seconds" or "resets in N seconds"
+        if let Some(pos) = error_msg.find("resets in ") {
+            let after = &error_msg[pos + "resets in ".len()..];
+            if let Some(end) = after.find(' ') {
+                if let Ok(secs) = after[..end].parse::<u64>() {
+                    return secs;
+                }
+            }
+        }
+        // Default backoff if we can't parse
+        3600 // 1 hour
     }
 
     /// Main run loop - fetches markets directly and manages pairs
@@ -257,6 +328,46 @@ impl MintMakerRunner {
         // 1. Check fills on open pairs
         let open_pairs = self.db.get_mint_maker_open_pairs(wallet_address).await?;
         for pair in &open_pairs {
+            // Validate order_id consistency with status
+            let has_yes = !pair.yes_order_id.is_empty();
+            let has_no = !pair.no_order_id.is_empty();
+
+            match pair.status.as_str() {
+                "Pending" => {
+                    // Pending should have both order IDs
+                    if !has_yes || !has_no {
+                        warn!(
+                            "MintMaker: Pair {} has status Pending but missing order IDs (yes={}, no={}) — marking Cancelled",
+                            pair.id, has_yes, has_no
+                        );
+                        let _ = self.db.update_mint_maker_pair_status(pair.id, "Cancelled").await;
+                        continue;
+                    }
+                }
+                "ExpPlaced" => {
+                    // ExpPlaced should have exactly one order ID
+                    if has_yes == has_no {
+                        warn!(
+                            "MintMaker: Pair {} has status ExpPlaced but invalid order IDs (yes={}, no={}) — marking Cancelled",
+                            pair.id, has_yes, has_no
+                        );
+                        let _ = self.db.update_mint_maker_pair_status(pair.id, "Cancelled").await;
+                        continue;
+                    }
+                }
+                "HalfFilled" => {
+                    // HalfFilled can have 0, 1, or 2 order IDs depending on inventory
+                    // Just log if both are empty (unusual but valid for inventory pairs)
+                    if !has_yes && !has_no {
+                        debug!(
+                            "MintMaker: Pair {} is HalfFilled with no order IDs (inventory-only pair)",
+                            pair.id
+                        );
+                    }
+                }
+                _ => {}
+            }
+
             if pair.status == "Pending" || pair.status == "HalfFilled" {
                 self.check_pair_fills(
                     wallet_address,
@@ -267,6 +378,135 @@ impl MintMakerRunner {
                 )
                 .await;
             }
+        }
+
+        // 1a. ExpPlaced fill checker — check if the expensive side has filled.
+        // If it has, place the cheap side now. If cancelled, mark pair Cancelled.
+        // This runs even when disabled so existing ExpPlaced pairs are handled.
+        for pair in &open_pairs {
+            if pair.status != "ExpPlaced" {
+                continue;
+            }
+
+            // Determine which side was the expensive (non-empty order_id)
+            let is_yes_expensive = !pair.yes_order_id.is_empty() && pair.no_order_id.is_empty();
+            let is_no_expensive = !pair.no_order_id.is_empty() && pair.yes_order_id.is_empty();
+            if !is_yes_expensive && !is_no_expensive {
+                warn!("MintMaker: ExpPlaced pair {} has unexpected order IDs (yes='{}', no='{}') — skipping",
+                    pair.id, pair.yes_order_id, pair.no_order_id);
+                continue;
+            }
+
+            let exp_order_id = if is_yes_expensive { &pair.yes_order_id } else { &pair.no_order_id };
+            let exp_label = if is_yes_expensive { "YES" } else { "NO" };
+
+            let result = order_manager::check_order_status(
+                wallet_address,
+                exp_order_id,
+                &api_key,
+                &api_secret,
+                &api_passphrase,
+            )
+            .await;
+
+            let (status, fill_price) = match &result {
+                Ok(r) => (r.fill_status, r.fill_price.clone()),
+                Err(e) => {
+                    debug!("MintMaker: ExpPlaced pair {} — check_order_status error: {}", pair.id, e);
+                    continue;
+                }
+            };
+
+            if status == FillStatus::Filled {
+                // Expensive side filled! Place the cheap side now.
+                let cheap_token = if is_yes_expensive {
+                    pair.no_token_id.as_deref().unwrap_or("")
+                } else {
+                    pair.yes_token_id.as_deref().unwrap_or("")
+                };
+                let cheap_price_str = if is_yes_expensive { &pair.no_bid_price } else { &pair.yes_bid_price };
+                let cheap_shares_str = if is_yes_expensive {
+                    pair.no_size.as_deref().unwrap_or(&pair.size)
+                } else {
+                    pair.yes_size.as_deref().unwrap_or(&pair.size)
+                };
+                let cheap_label = if is_yes_expensive { "NO" } else { "YES" };
+
+                let cheap_price: Decimal = cheap_price_str.parse().unwrap_or(Decimal::ZERO);
+                let cheap_shares: Decimal = cheap_shares_str.parse().unwrap_or(Decimal::ZERO);
+
+                if let Some(private_key) = self.key_store.get_key(wallet_address).await {
+                    match order_manager::place_gtc_bid(
+                        &private_key,
+                        cheap_token,
+                        cheap_price,
+                        cheap_shares,
+                    )
+                    .await
+                    {
+                        Ok(cheap_order_id) => {
+                            let exp_fill = fill_price.as_deref().unwrap_or("0");
+                            let _ = self.db.update_mint_maker_pair_cheap_order(
+                                pair.id,
+                                &cheap_order_id,
+                                exp_fill,
+                                is_yes_expensive,
+                            ).await;
+
+                            // Update analytics: expensive side filled, cheap side placed
+                            let _ = self.db.update_analytics_expensive_filled(pair.id).await;
+                            let _ = self.db.update_analytics_cheap_placed(pair.id).await;
+
+                            let _ = self.db.log_mint_maker_action(
+                                wallet_address,
+                                "cheap_placed",
+                                Some(&pair.market_id),
+                                Some(&pair.question),
+                                Some(&pair.asset),
+                                if is_yes_expensive { fill_price.as_deref() } else { Some(cheap_price_str) },
+                                if is_yes_expensive { Some(cheap_price_str) } else { fill_price.as_deref() },
+                                None, None,
+                                Some(&pair.size),
+                                Some(&format!(
+                                    "{} (expensive) filled @{} — {} (cheap) placed @{}x{}",
+                                    exp_label, exp_fill, cheap_label, cheap_price, cheap_shares
+                                )),
+                            ).await;
+                            info!(
+                                "MintMaker: Pair {} — {} filled @{}, placed {} @{}x{} → HalfFilled",
+                                pair.id, exp_label, exp_fill, cheap_label, cheap_price, cheap_shares
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "MintMaker: Pair {} — {} filled but {} GTC placement failed: {}. Will retry next cycle.",
+                                pair.id, exp_label, cheap_label, e
+                            );
+                            // Don't change status — retry next cycle while still ExpPlaced
+                        }
+                    }
+                } else {
+                    warn!(
+                        "MintMaker: Pair {} — {} filled but no private key loaded for {}. Cannot place cheap side.",
+                        pair.id, exp_label, &wallet_address[..8]
+                    );
+                }
+            } else if status == FillStatus::Cancelled {
+                // Expensive side was cancelled (by CLOB or manually) — zero loss
+                let _ = self.db.update_mint_maker_pair_status(pair.id, "Cancelled").await;
+                let _ = self.db.log_mint_maker_action(
+                    wallet_address,
+                    "exp_cancelled",
+                    Some(&pair.market_id),
+                    Some(&pair.question),
+                    Some(&pair.asset),
+                    None, None, None, None,
+                    Some(&pair.size),
+                    Some(&format!("{} (expensive) order cancelled — $0 loss", exp_label)),
+                ).await;
+                info!("MintMaker: Pair {} — {} (expensive) cancelled, $0 loss", pair.id, exp_label);
+            }
+            // else: Open/PartiallyFilled/Unknown — keep waiting
         }
 
         // 1b. Stop loss — disabled. Half-filled pairs ride to market close.
@@ -293,11 +533,12 @@ impl MintMakerRunner {
         );
 
         // 2. Merge matched pairs (with cooldown + retry limit)
+        //    Skipped entirely if relay is backed off from a 429.
         let matched_pairs = self
             .db
             .get_mint_maker_pairs_by_status(wallet_address, "Matched")
             .await?;
-        if !matched_pairs.is_empty() {
+        if !matched_pairs.is_empty() && !self.is_relay_backed_off(wallet_address).await {
             if let Some(private_key) = self.key_store.get_key(wallet_address).await {
                 match (
                     std::env::var("POLY_BUILDER_API_KEY").ok(),
@@ -305,7 +546,13 @@ impl MintMakerRunner {
                     std::env::var("POLY_BUILDER_PASSPHRASE").ok(),
                 ) {
                     (Some(bk), Some(bs), Some(bp)) => {
+                        const MERGE_PER_CYCLE_CAP: u32 = 3;
+                        let mut merges_this_cycle: u32 = 0;
                         for pair in &matched_pairs {
+                            if merges_this_cycle >= MERGE_PER_CYCLE_CAP {
+                                debug!("MintMaker: Hit merge cap ({}/cycle), remaining pairs will retry next cycle", MERGE_PER_CYCLE_CAP);
+                                break;
+                            }
                             // Check merge cooldown: wait 30s between attempts, give up after 5 min
                             const MERGE_COOLDOWN_SECS: u64 = 30;
                             const MERGE_MAX_ATTEMPTS: u32 = 10; // 10 * 30s = 5 min
@@ -339,6 +586,7 @@ impl MintMakerRunner {
                             let attempt_num = *attempts;
                             drop(tracker);
 
+                            merges_this_cycle += 1;
                             match inventory::merge_matched_pair(
                                 &self.db,
                                 pair.id,
@@ -357,6 +605,13 @@ impl MintMakerRunner {
                                 Ok(Some(tx_id)) => {
                                     // Success — remove from tracker
                                     self.merge_tracker.lock().await.remove(&pair.id);
+
+                                    // Update analytics: pair merged successfully
+                                    let merge_pnl = pair.profit.as_ref()
+                                        .and_then(|p| p.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    let _ = self.db.update_analytics_merged(pair.id, merge_pnl).await;
+
                                     let _ = self
                                         .db
                                         .log_mint_maker_action(
@@ -380,7 +635,24 @@ impl MintMakerRunner {
                                         pair.id, attempt_num, MERGE_MAX_ATTEMPTS
                                     );
                                 }
-                                Err(e) => warn!("MintMaker merge error for pair {}: {}", pair.id, e),
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    if err_str.contains("Relay error 429") || err_str.contains("rate limit") {
+                                        let backoff_secs = Self::parse_relay_backoff_seconds(&err_str);
+                                        self.set_relay_backoff(wallet_address, backoff_secs).await;
+                                        // Stop trying more merges this cycle
+                                        break;
+                                    }
+                                    if err_str.contains("Safe holds 0 tokens") {
+                                        // Tokens are gone — either never delivered or already redeemed.
+                                        // No point retrying.
+                                        warn!("MintMaker: Pair {} has 0 tokens — marking MergeFailed", pair.id);
+                                        let _ = self.db.update_mint_maker_pair_status(pair.id, "MergeFailed").await;
+                                        self.merge_tracker.lock().await.remove(&pair.id);
+                                        continue;
+                                    }
+                                    warn!("MintMaker merge error for pair {}: {}", pair.id, err_str);
+                                }
                             }
                         }
                     }
@@ -406,14 +678,19 @@ impl MintMakerRunner {
             warn!("MintMaker auto-redeem error for {}: {}", &wallet_address[..8], e);
         }
 
-        // 3. Cancel expired pairs — only cancel Pending orders whose market has closed
+        // 3. Cancel expired pairs — only cancel Pending/ExpPlaced orders whose market has closed
         //    (end_date has passed). Orders on open/future markets should keep waiting.
         let pending_pairs = self
             .db
             .get_mint_maker_pairs_by_status(wallet_address, "Pending")
             .await?;
+        let exp_placed_pairs = self
+            .db
+            .get_mint_maker_pairs_by_status(wallet_address, "ExpPlaced")
+            .await?;
+        let cancelable_pairs: Vec<_> = pending_pairs.iter().chain(exp_placed_pairs.iter()).collect();
         let now = Utc::now();
-        for pair in &pending_pairs {
+        for pair in &cancelable_pairs {
             // Find the market's end_date from the scanned data
             let market_ended = raw_markets.iter()
                 .find(|m| m.condition_id == pair.condition_id)
@@ -428,23 +705,28 @@ impl MintMakerRunner {
                 continue;
             }
 
-            info!("MintMaker: Cancelling expired pair {} — market has closed", pair.id);
-            let _ = order_manager::cancel_order(
-                wallet_address,
-                &pair.yes_order_id,
-                &api_key,
-                &api_secret,
-                &api_passphrase,
-            )
-            .await;
-            let _ = order_manager::cancel_order(
-                wallet_address,
-                &pair.no_order_id,
-                &api_key,
-                &api_secret,
-                &api_passphrase,
-            )
-            .await;
+            info!("MintMaker: Cancelling expired {} pair {} — market has closed", pair.status, pair.id);
+            // Cancel non-empty order IDs (ExpPlaced pairs only have one side)
+            if !pair.yes_order_id.is_empty() {
+                let _ = order_manager::cancel_order(
+                    wallet_address,
+                    &pair.yes_order_id,
+                    &api_key,
+                    &api_secret,
+                    &api_passphrase,
+                )
+                .await;
+            }
+            if !pair.no_order_id.is_empty() {
+                let _ = order_manager::cancel_order(
+                    wallet_address,
+                    &pair.no_order_id,
+                    &api_key,
+                    &api_secret,
+                    &api_passphrase,
+                )
+                .await;
+            }
             let _ = self
                 .db
                 .update_mint_maker_pair_status(pair.id, "Cancelled")
@@ -462,7 +744,7 @@ impl MintMakerRunner {
                     None,
                     None,
                     Some(&pair.size),
-                    Some("Market closed — unfilled orders cancelled"),
+                    Some(&format!("Market closed — {} orders cancelled", pair.status)),
                 )
                 .await;
         }
@@ -525,20 +807,20 @@ impl MintMakerRunner {
                     // Fall through — remaining_balance of 0 will cause all pairs to be skipped
                 }
 
-                // Virtual balance: Matched/Merging pairs will return $1/share on merge.
-                // Count this as available capital so the budget isn't starved while merges are in-flight.
-                let merging_capital = Decimal::from_str(
-                    &format!("{:.4}", self.db.sum_mint_maker_merging_capital(wallet_address).await.unwrap_or(0.0))
+                // Subtract capital already committed to live orders (ExpPlaced/Pending/HalfFilled)
+                // so we don't double-spend across cycles (on-chain balance doesn't change
+                // until GTC orders actually fill).
+                let committed = Decimal::from_str(
+                    &format!("{:.4}", self.db.sum_mint_maker_committed_capital(wallet_address).await.unwrap_or(0.0))
                 ).unwrap_or(Decimal::ZERO);
-                let available = if merging_capital > Decimal::ZERO {
-                    info!("MintMaker: Virtual balance: on-chain=${} + merging=${} = ${}",
-                        on_chain_available, merging_capital, on_chain_available + merging_capital);
-                    on_chain_available + merging_capital
+                let available = on_chain_available - committed;
+                if committed > Decimal::ZERO {
+                    info!("MintMaker: Balance: on-chain=${} - committed=${} = ${}",
+                        on_chain_available, committed, available);
                 } else {
-                    on_chain_available
-                };
-
-                let mut remaining_balance = if on_chain_available > Decimal::ZERO { on_chain_available } else { Decimal::ZERO };
+                    info!("MintMaker: Balance: ${}", on_chain_available);
+                }
+                let mut remaining_balance = if available > Decimal::ZERO { available } else { Decimal::ZERO };
 
                 // USD per side: either balance-based (auto_size_pct > 0) or fixed
                 // In smart mode, divide by actual selected assets (not max_markets) to avoid
@@ -574,11 +856,16 @@ impl MintMakerRunner {
                     eligible_markets.iter().map(|m| std::cmp::max(m.yes_price, m.no_price)).max().unwrap_or(Decimal::from_str("0.50").unwrap()),
                     Decimal::from_str("0.50").unwrap(),
                 );
+                // Calculate pairs from budget, but RESPECT user's max as upper bound
+                let budget_pairs = (usd_per_side_raw / (smart_max_price * Decimal::from(5))).floor().to_string().parse::<i32>().unwrap_or(1).max(1);
                 let smart_pairs_per_market = std::cmp::min(
-                    (usd_per_side_raw / (smart_max_price * Decimal::from(5))).floor().to_string().parse::<i32>().unwrap_or(1).max(1),
-                    5,
+                    std::cmp::min(budget_pairs, 5),  // cap at 5
+                    settings.max_pairs_per_market,   // but also respect user's setting
                 );
-                let smart_total_pairs = std::cmp::min(smart_pairs_per_market * num_selected_assets, 30);
+                let smart_total_pairs = std::cmp::min(
+                    smart_pairs_per_market * num_selected_assets,
+                    settings.max_total_pairs,  // respect user's total cap too
+                );
 
                 // In smart mode, split the per-market budget evenly across pairs
                 let usd_per_side = if settings.smart_mode && smart_pairs_per_market > 1 {
@@ -596,16 +883,16 @@ impl MintMakerRunner {
 
                 if settings.smart_mode {
                     info!(
-                        "MintMaker: SMART MODE — max_cost={} pairs/mkt={} total={} delay={}m",
-                        smart_max_cost, smart_pairs_per_market, smart_total_pairs, effective_delay_mins
+                        "MintMaker: SMART MODE — max_cost={} pairs/mkt={} total={} delay={}m{}",
+                        smart_max_cost, smart_pairs_per_market, smart_total_pairs, effective_delay_mins,
+                        if settings.stop_after_profit { " [STOP-AFTER-PROFIT]" } else { "" }
                     );
                 }
 
-                // Auto-place on markets in the current 15-min window.
-                // auto_place_delay_mins: wait N minutes into the window before placing.
-                // e.g. delay=3 means only place when minutes_to_close <= 12.
+                // Auto-place on markets in the current (and optionally next) 15-min window.
+                // pre_place: also place on the NEXT window (15-30 min out) for early queue position.
                 let delay_mins = effective_delay_mins;
-                let place_cutoff = 15.0 - delay_mins;
+                let place_cutoff = if settings.pre_place { 30.0 - delay_mins } else { 15.0 - delay_mins };
                 // Markets past the delay cutoff that still have capacity for more pairs.
                 // We allow 1 new pair per market per cycle (natural 30s cooldown).
                 // Never bid on markets with less than 5 minutes left — not enough
@@ -617,6 +904,20 @@ impl MintMakerRunner {
                     if m.minutes_to_close > place_cutoff || m.minutes_to_close <= min_time {
                         continue;
                     }
+
+                    // stop_after_profit: skip markets that already have a merged pair,
+                    // but allow unlimited retries on markets that only have orphans.
+                    if settings.stop_after_profit {
+                        let has_merge = self
+                            .db
+                            .has_mint_maker_merged_pair_for_market(wallet_address, &m.market_id)
+                            .await
+                            .unwrap_or(false);
+                        if has_merge {
+                            continue;
+                        }
+                    }
+
                     // Only count Pending/HalfFilled — Matched/Merging are done filling
                     // and shouldn't block new pair placement.
                     let market_pairs = self
@@ -624,17 +925,22 @@ impl MintMakerRunner {
                         .count_mint_maker_unfilled_pairs_for_market(wallet_address, &m.market_id)
                         .await
                         .unwrap_or(0);
-                    if market_pairs >= effective_max_pairs_per_market as i64 {
+                    // stop_after_profit: only 1 pair at a time (wait for outcome before next)
+                    let pair_cap = if settings.stop_after_profit { 1 } else { effective_max_pairs_per_market as i64 };
+                    if market_pairs >= pair_cap {
                         continue;
                     }
-                    // Cap total attempts (all statuses) per market
-                    let total_attempts = self
-                        .db
-                        .count_mint_maker_all_pairs_for_market(wallet_address, &m.market_id)
-                        .await
-                        .unwrap_or(0);
-                    if total_attempts >= settings.auto_max_attempts as i64 {
-                        continue;
+                    // Cap total attempts (all statuses) per market — skip in stop_after_profit
+                    // mode since we allow unlimited retries until a merge happens.
+                    if !settings.stop_after_profit {
+                        let total_attempts = self
+                            .db
+                            .count_mint_maker_all_pairs_for_market(wallet_address, &m.market_id)
+                            .await
+                            .unwrap_or(0);
+                        if total_attempts >= settings.auto_max_attempts as i64 {
+                            continue;
+                        }
                     }
                     placeable_markets.push(m);
                 }
@@ -689,8 +995,15 @@ impl MintMakerRunner {
                         break;
                     }
 
-                    // In smart mode, place multiple pairs per market in one cycle
-                    let pairs_this_market = if settings.smart_mode { effective_max_pairs_per_market } else { 1 };
+                    // In smart mode, place multiple pairs per market in one cycle.
+                    // stop_after_profit: always 1 pair at a time — wait for outcome.
+                    let pairs_this_market = if settings.stop_after_profit {
+                        1
+                    } else if settings.smart_mode {
+                        effective_max_pairs_per_market
+                    } else {
+                        1
+                    };
 
                     'pairs: for _pair_idx in 0..pairs_this_market {
 
@@ -811,6 +1124,54 @@ impl MintMakerRunner {
                         break 'pairs;
                     }
 
+                    // Skip lopsided markets — if either side is below 15¢, the expensive
+                    // side is unlikely to fill and we end up with a losing half-fill.
+                    let skew_floor = Decimal::from_str("0.15").unwrap();
+                    if cheap_bid < skew_floor {
+                        info!("MintMaker: SKIP {} — too lopsided (cheap_bid={}¢ < 15¢ floor)",
+                            market.asset, cheap_bid * Decimal::from(100));
+                        break 'pairs;
+                    }
+
+                    // === MOMENTUM FILTER (with auto depth confirmation) ===
+                    // Only enter when the market shows conviction (price away from 50/50)
+                    // When enabled, also checks orderbook depth with auto-scaled ratio
+                    let momentum_threshold = Decimal::from_f64(settings.momentum_threshold).unwrap_or(Decimal::ZERO);
+                    if momentum_threshold > Decimal::ZERO {
+                        let (passes, reason) = scanner::check_momentum_filter(
+                            market.yes_price,
+                            market.no_price,
+                            momentum_threshold,
+                        );
+                        if !passes {
+                            info!("MintMaker: SKIP {} — momentum: {}", market.asset, reason);
+                            break 'pairs;
+                        }
+
+                        // Auto depth check: fetch orderbook and verify depth confirms momentum
+                        let http_client = reqwest::Client::new();
+                        let yes_depth = scanner::fetch_orderbook_depth(&http_client, &market.yes_token_id).await;
+                        let no_depth = scanner::fetch_orderbook_depth(&http_client, &market.no_token_id).await;
+
+                        if let (Some(yd), Some(nd)) = (yes_depth, no_depth) {
+                            let expensive_price = if yes_is_cheap { market.no_price } else { market.yes_price };
+                            let (passes, reason) = scanner::check_depth_filter_auto(
+                                yd.total_bid_value,
+                                nd.total_bid_value,
+                                !yes_is_cheap, // yes_is_expensive
+                                expensive_price,
+                            );
+                            if !passes {
+                                info!("MintMaker: SKIP {} — {}", market.asset, reason);
+                                break 'pairs;
+                            }
+                            info!("MintMaker: {} momentum+depth OK: {}", market.asset, reason);
+                        } else {
+                            info!("MintMaker: SKIP {} — couldn't fetch orderbook for depth check", market.asset);
+                            break 'pairs;
+                        }
+                    }
+
                     // Don't bid at or above current price on the expensive side
                     // (would cross the spread and taker-fill immediately).
                     // Instead of skipping, cap at current - 1¢ which gives better profit.
@@ -846,26 +1207,72 @@ impl MintMakerRunner {
                         break 'pairs;
                     }
 
-                    // Calculate EQUAL shares for both sides so every share can be merged.
-                    // Use the more expensive side to determine share count (ensures we
-                    // can afford both sides and don't end up with unmatched leftovers).
+                    // === INVENTORY-AWARE PAIRING ===
+                    // Check existing token balances to account for leftover shares from previous pairs.
+                    // This prevents orphaned shares from accumulating and ensures we can merge everything.
+                    let ctf = crate::services::CtfService::new();
+                    let existing_yes = ctf.get_token_balance(&private_key, &market.yes_token_id)
+                        .await.unwrap_or(Decimal::ZERO);
+                    let existing_no = ctf.get_token_balance(&private_key, &market.no_token_id)
+                        .await.unwrap_or(Decimal::ZERO);
+
+                    // Calculate base shares from budget
                     let max_price = std::cmp::max(yes_price, no_price);
-                    let shares = if max_price > Decimal::ZERO { (usd_per_side / max_price).floor() } else { Decimal::ZERO };
+                    let base_shares = if max_price > Decimal::ZERO { (usd_per_side / max_price).floor() } else { Decimal::ZERO };
 
                     // CLOB requires minimum 5 shares per order
                     let min_shares = Decimal::from(5);
-                    if shares < min_shares {
+
+                    // Target: balance at the highest level we can afford
+                    // If we have existing inventory, try to balance it out
+                    // Cap at 2x base_shares to prevent runaway inventory bloat
+                    let max_target = base_shares * Decimal::from(2);
+                    let target_shares = if existing_yes > Decimal::ZERO || existing_no > Decimal::ZERO {
+                        // We have existing inventory - aim to balance at the max existing level
+                        let max_existing = std::cmp::max(existing_yes, existing_no);
+                        // Cap to prevent bloat: don't exceed 2x what budget allows
+                        std::cmp::min(std::cmp::max(base_shares, max_existing), max_target)
+                    } else {
+                        base_shares
+                    };
+
+                    // Calculate how many MORE shares we need to order on each side
+                    let yes_to_order = std::cmp::max(Decimal::ZERO, target_shares - existing_yes);
+                    let no_to_order = std::cmp::max(Decimal::ZERO, target_shares - existing_no);
+
+                    // Log inventory adjustment if applicable
+                    if existing_yes > Decimal::ZERO || existing_no > Decimal::ZERO {
                         info!(
-                            "MintMaker: SKIP {} — shares {} below min 5 at max_price={}. Need ${}/side.",
-                            market.asset, shares, max_price,
-                            (min_shares * max_price).ceil()
+                            "MintMaker: {} existing inventory YES={} NO={} → ordering YES={} NO={} to balance at {}",
+                            market.asset, existing_yes, existing_no, yes_to_order, no_to_order, target_shares
+                        );
+                    }
+
+                    // If one side needs 0 orders and the other needs < min_shares, skip
+                    // (can't place order below 5 shares)
+                    if (yes_to_order > Decimal::ZERO && yes_to_order < min_shares) ||
+                       (no_to_order > Decimal::ZERO && no_to_order < min_shares) {
+                        info!(
+                            "MintMaker: SKIP {} — order size below min 5 (YES={} NO={})",
+                            market.asset, yes_to_order, no_to_order
                         );
                         break 'pairs;
                     }
-                    let yes_shares = shares;
-                    let no_shares = shares;
-                    let merge_size = shares;
-                    let total_cost = (shares * yes_price) + (shares * no_price);
+
+                    // If both sides are already balanced (both need 0), nothing to do
+                    if yes_to_order == Decimal::ZERO && no_to_order == Decimal::ZERO {
+                        info!(
+                            "MintMaker: SKIP {} — already balanced at {} shares each, no orders needed",
+                            market.asset, target_shares
+                        );
+                        break 'pairs;
+                    }
+
+                    // Use the target for merge size (this is what we'll have after orders fill)
+                    let yes_shares = yes_to_order;
+                    let no_shares = no_to_order;
+                    let merge_size = target_shares;
+                    let total_cost = (yes_to_order * yes_price) + (no_to_order * no_price);
 
                     // Check balance
                     if total_cost > remaining_balance {
@@ -876,136 +1283,123 @@ impl MintMakerRunner {
                         break 'pairs;
                     }
 
-                    // Momentum bias: look at the expiring market for this asset to decide
-                    // which side to place first. If the previous market's YES > 0.90, YES
-                    // is winning → place YES first. If YES < 0.10, NO is winning → place
-                    // NO first. This biases toward filling the winning side first.
-                    let yes_first = {
-                        let expiring = eligible_markets.iter().find(|m| {
-                            m.asset == market.asset
-                                && m.market_id != market.market_id
-                                && m.minutes_to_close < 0.5
-                                && m.minutes_to_close >= 0.0
-                        });
-                        match expiring {
-                            Some(prev) if prev.yes_price > Decimal::from_str("0.85").unwrap() => {
-                                info!("MintMaker: Momentum bias → YES first (prev {} YES@{})", market.asset, prev.yes_price);
-                                true
-                            }
-                            Some(prev) if prev.yes_price < Decimal::from_str("0.15").unwrap() => {
-                                info!("MintMaker: Momentum bias → NO first (prev {} YES@{})", market.asset, prev.yes_price);
-                                false
-                            }
-                            _ => true, // default: YES first
-                        }
-                    };
+                    // === ORDER PLACEMENT WITH INVENTORY AWARENESS ===
+                    // Handle three cases:
+                    // 1. Both sides need orders → ExpPlaced flow (expensive first)
+                    // 2. Only one side needs orders → place that side, mark as HalfFilled
+                    // 3. Neither needs orders → already handled above
 
-                    // Place orders: momentum side first for better fill probability
-                    let (first_token, first_price, first_shares, first_label,
-                         second_token, second_price, second_shares, second_label) = if yes_first {
-                        (&market.yes_token_id, yes_price, yes_shares, "YES",
-                         &market.no_token_id, no_price, no_shares, "NO")
-                    } else {
-                        (&market.no_token_id, no_price, no_shares, "NO",
-                         &market.yes_token_id, yes_price, yes_shares, "YES")
-                    };
+                    let is_yes_expensive = !yes_is_cheap;
+                    let exp_needs_order = if is_yes_expensive { yes_shares > Decimal::ZERO } else { no_shares > Decimal::ZERO };
+                    let cheap_needs_order = if is_yes_expensive { no_shares > Decimal::ZERO } else { yes_shares > Decimal::ZERO };
 
-                    let first_order_id = match order_manager::place_gtc_bid(
-                        &private_key,
-                        first_token,
-                        first_price,
-                        first_shares,
-                    )
-                    .await
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            warn!("MintMaker auto-place {} GTC failed for {}: {}", first_label, market.market_id, e);
-                            break 'pairs;
-                        }
-                    };
+                    let (yes_order_id, no_order_id, initial_status): (String, String, &str) =
+                        if exp_needs_order && cheap_needs_order {
+                            // Normal case: both sides need orders, place expensive first
+                            let (exp_token, exp_price, exp_shares_val, exp_label) = if is_yes_expensive {
+                                (&market.yes_token_id, yes_price, yes_shares, "YES")
+                            } else {
+                                (&market.no_token_id, no_price, no_shares, "NO")
+                            };
 
-                    // Place second side. If this fails, try to cancel first; if cancel fails, record orphan.
-                    let second_order_id = match order_manager::place_gtc_bid(
-                        &private_key,
-                        second_token,
-                        second_price,
-                        second_shares,
-                    )
-                    .await
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            warn!(
-                                "MintMaker auto-place {} GTC failed, cancelling {} {}: {}",
-                                second_label, first_label, first_order_id, e
-                            );
-                            let cancel_ok = order_manager::cancel_order(
-                                wallet_address,
-                                &first_order_id,
-                                &api_key,
-                                &api_secret,
-                                &api_passphrase,
-                            )
-                            .await
-                            .is_ok();
-
-                            if !cancel_ok {
-                                warn!("MintMaker: {} cancel failed — recording orphaned order {}", first_label, first_order_id);
-                                let asset_str = market.asset.to_string();
-                                let first_price_str = first_price.to_string();
-                                let shares_str = first_shares.to_string();
-                                let (orphan_yes_id, orphan_no_id) = if yes_first {
-                                    (first_order_id.as_str(), "")
-                                } else {
-                                    ("", first_order_id.as_str())
-                                };
-                                let (orphan_yes_price, orphan_no_price) = if yes_first {
-                                    (first_price_str.as_str(), "0")
-                                } else {
-                                    ("0", first_price_str.as_str())
-                                };
-                                if let Ok(pair_id) = self.db.create_mint_maker_pair(
-                                    wallet_address,
-                                    &market.market_id,
-                                    &market.condition_id,
-                                    &market.question,
-                                    &asset_str,
-                                    orphan_yes_id, orphan_no_id,
-                                    orphan_yes_price, orphan_no_price,
-                                    &shares_str,
-                                    Some(&shares_str), None,
-                                    Some(&market.slug),
-                                    Some(&market.yes_token_id),
-                                    Some(&market.no_token_id),
-                                    market.neg_risk,
-                                ).await {
-                                    let _ = self.db.update_mint_maker_pair_status(pair_id, "Orphaned").await;
+                            let exp_order_id = match order_manager::place_gtc_bid(
+                                &private_key,
+                                exp_token,
+                                exp_price,
+                                exp_shares_val,
+                            ).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!("MintMaker auto-place {} (expensive) GTC failed for {}: {}", exp_label, market.market_id, e);
+                                    break 'pairs;
                                 }
-                                let _ = self.db.log_mint_maker_action(
-                                    wallet_address,
-                                    "orphaned",
-                                    Some(&market.market_id),
-                                    Some(&market.question),
-                                    Some(&asset_str),
-                                    Some(&first_price_str), None,
-                                    None, None,
-                                    Some(&shares_str),
-                                    Some(&format!("{} GTC {} — {} failed, cancel failed — orphaned", first_label, first_order_id, second_label)),
-                                ).await;
+                            };
+
+                            info!(
+                                "MintMaker: ExpPlaced {} for {} @{}x{} — cheap side queued",
+                                exp_label, market.asset, exp_price, exp_shares_val
+                            );
+
+                            if is_yes_expensive {
+                                (exp_order_id, String::new(), "ExpPlaced")
+                            } else {
+                                (String::new(), exp_order_id, "ExpPlaced")
                             }
+                        } else if cheap_needs_order && !exp_needs_order {
+                            // Expensive side has inventory, only need cheap side
+                            // Place cheap side directly, mark as HalfFilled (expensive "filled" from inventory)
+                            let (cheap_token, cheap_price, cheap_shares_val, cheap_label) = if is_yes_expensive {
+                                (&market.no_token_id, no_price, no_shares, "NO")
+                            } else {
+                                (&market.yes_token_id, yes_price, yes_shares, "YES")
+                            };
+
+                            let cheap_order_id = match order_manager::place_gtc_bid(
+                                &private_key,
+                                cheap_token,
+                                cheap_price,
+                                cheap_shares_val,
+                            ).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!("MintMaker auto-place {} (cheap, inventory-aware) GTC failed for {}: {}", cheap_label, market.market_id, e);
+                                    break 'pairs;
+                                }
+                            };
+
+                            info!(
+                                "MintMaker: {} has {} existing inventory — placing {} only @{}x{}",
+                                market.asset,
+                                if is_yes_expensive { existing_yes } else { existing_no },
+                                cheap_label, cheap_price, cheap_shares_val
+                            );
+
+                            // Mark expensive side as "filled" with inventory price
+                            if is_yes_expensive {
+                                (String::new(), cheap_order_id, "HalfFilled")
+                            } else {
+                                (cheap_order_id, String::new(), "HalfFilled")
+                            }
+                        } else if exp_needs_order && !cheap_needs_order {
+                            // Cheap side has inventory, only need expensive side
+                            let (exp_token, exp_price_val, exp_shares_val, exp_label) = if is_yes_expensive {
+                                (&market.yes_token_id, yes_price, yes_shares, "YES")
+                            } else {
+                                (&market.no_token_id, no_price, no_shares, "NO")
+                            };
+
+                            let exp_order_id = match order_manager::place_gtc_bid(
+                                &private_key,
+                                exp_token,
+                                exp_price_val,
+                                exp_shares_val,
+                            ).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!("MintMaker auto-place {} (exp, inventory-aware) GTC failed for {}: {}", exp_label, market.market_id, e);
+                                    break 'pairs;
+                                }
+                            };
+
+                            info!(
+                                "MintMaker: {} has {} existing {} inventory — placing {} only @{}x{}",
+                                market.asset,
+                                if is_yes_expensive { existing_no } else { existing_yes },
+                                if is_yes_expensive { "NO" } else { "YES" },
+                                exp_label, exp_price_val, exp_shares_val
+                            );
+
+                            // Mark cheap side as "filled" with inventory
+                            if is_yes_expensive {
+                                (exp_order_id, String::new(), "HalfFilled")
+                            } else {
+                                (String::new(), exp_order_id, "HalfFilled")
+                            }
+                        } else {
+                            // Neither needs orders - shouldn't reach here (handled above)
                             break 'pairs;
-                        }
-                    };
+                        };
 
-                    // Map back to YES/NO order IDs for DB record
-                    let (yes_order_id, no_order_id) = if yes_first {
-                        (first_order_id, second_order_id)
-                    } else {
-                        (second_order_id, first_order_id)
-                    };
-
-                    // Both GTC orders placed. Record the pair.
                     let pair_cost = yes_price + no_price;
                     let per_pair_profit = Decimal::ONE - pair_cost;
                     let asset_str = market.asset.to_string();
@@ -1017,7 +1411,7 @@ impl MintMakerRunner {
                     let yes_shares_str = yes_shares.to_string();
                     let no_shares_str = no_shares.to_string();
 
-                    let _ = self
+                    let pair_id = self
                         .db
                         .create_mint_maker_pair(
                             wallet_address,
@@ -1036,14 +1430,50 @@ impl MintMakerRunner {
                             Some(&market.yes_token_id),
                             Some(&market.no_token_id),
                             market.neg_risk,
+                            initial_status,
                         )
-                        .await;
+                        .await
+                        .unwrap_or(-1);
+
+                    // Create analytics record for this pair
+                    let expensive_side = if is_yes_expensive { "YES" } else { "NO" };
+                    let (exp_price_f64, cheap_price_f64) = if is_yes_expensive {
+                        (yes_price.to_f64().unwrap_or(0.0), no_price.to_f64().unwrap_or(0.0))
+                    } else {
+                        (no_price.to_f64().unwrap_or(0.0), yes_price.to_f64().unwrap_or(0.0))
+                    };
+                    if pair_id > 0 {
+                        let _ = self.db.create_mint_maker_analytics(
+                            wallet_address,
+                            pair_id,
+                            &market.market_id,
+                            Some(&asset_str),
+                            Some(&market.slug),
+                            expensive_side,
+                            exp_price_f64,
+                            cheap_price_f64,
+                            merge_size.to_f64().unwrap_or(0.0),
+                        ).await;
+                    }
+
+                    let action_type = if initial_status == "HalfFilled" { "inventory_pair" } else { "exp_placed" };
+                    let log_msg = if initial_status == "HalfFilled" {
+                        format!(
+                            "Inventory-aware: existing YES={} NO={}, ordering YES={} NO={} @{}/{}",
+                            existing_yes, existing_no, yes_shares, no_shares, yes_price, no_price
+                        )
+                    } else {
+                        format!(
+                            "ExpPlaced: YES@{}x{}, NO@{}x{} (${}/side)",
+                            yes_price, yes_shares, no_price, no_shares, usd_per_side
+                        )
+                    };
 
                     let _ = self
                         .db
                         .log_mint_maker_action(
                             wallet_address,
-                            "auto_place",
+                            action_type,
                             Some(&market.market_id),
                             Some(&market.question),
                             Some(&asset_str),
@@ -1052,17 +1482,9 @@ impl MintMakerRunner {
                             Some(&pair_cost_str),
                             Some(&profit_str),
                             Some(&merge_size_str),
-                            Some(&format!(
-                                "GTC@market ${}/side YES@{}x{} NO@{}x{}",
-                                usd_per_side, yes_price, yes_shares, no_price, no_shares
-                            )),
+                            Some(&log_msg),
                         )
                         .await;
-
-                    info!(
-                        "MintMaker: Auto-placed GTC pair for {} - YES@{}x{} NO@{}x{} (${}/side)",
-                        market.asset, yes_price, yes_shares, no_price, no_shares, usd_per_side
-                    );
 
                     remaining_balance -= total_cost;
                     total_open += 1;
@@ -1462,6 +1884,9 @@ impl MintMakerRunner {
                     Some(&format!("{} filled, {} cancelled by CLOB — orphaned position", which_filled, which_cancelled)),
                 )
                 .await;
+
+            // Update analytics: pair became an orphan
+            let _ = self.db.update_analytics_orphaned(pair.id, which_filled).await;
         } else if yes_filled || no_filled {
             // One side filled, other still open — mark as HalfFilled.
             // Only update if not already HalfFilled to avoid resetting updated_at
@@ -1626,11 +2051,17 @@ impl MintMakerRunner {
         })
     }
 
-    /// Check for resolved markets and redeem winning tokens via CTF relay
+    /// Check for resolved markets and redeem winning tokens via CTF relay.
+    /// Rate-limited: at most 1 relay redeem per cycle; respects global relay backoff.
     async fn check_auto_redeem(
         &self,
         wallet_address: &str,
     ) -> anyhow::Result<()> {
+        // Respect relay backoff (shared with merge)
+        if self.is_relay_backed_off(wallet_address).await {
+            return Ok(());
+        }
+
         let pairs = self.db.get_mint_maker_redeemable_pairs(wallet_address).await?;
         if pairs.is_empty() {
             return Ok(());
@@ -1658,8 +2089,14 @@ impl MintMakerRunner {
 
         // Deduplicate by condition_id — multiple pairs can share the same market
         let mut checked_conditions: HashSet<String> = HashSet::new();
+        const REDEEM_PER_CYCLE_CAP: u32 = 3;
+        let mut redeems_this_cycle: u32 = 0;
 
         for pair in &pairs {
+            if redeems_this_cycle >= REDEEM_PER_CYCLE_CAP {
+                debug!("MintMaker auto-redeem: hit cap ({}/cycle), remaining will retry next cycle", REDEEM_PER_CYCLE_CAP);
+                break;
+            }
             if checked_conditions.contains(&pair.condition_id) {
                 continue;
             }
@@ -1676,6 +2113,7 @@ impl MintMakerRunner {
                 &pair.condition_id[..10], &wallet_address[..8]
             );
 
+            redeems_this_cycle += 1;
             let ctf = crate::services::CtfService::new();
             match ctf.redeem(
                 &pair.condition_id,
@@ -1768,12 +2206,32 @@ impl MintMakerRunner {
                 }
                 Ok(resp) => {
                     let err = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                    // Check for 429 rate limit and set backoff
+                    if err.contains("Relay error 429") || err.contains("rate limit") {
+                        let backoff_secs = Self::parse_relay_backoff_seconds(&err);
+                        self.set_relay_backoff(wallet_address, backoff_secs).await;
+                        warn!(
+                            "MintMaker auto-redeem 429 for condition {}: {}",
+                            &pair.condition_id[..10], err
+                        );
+                        break;
+                    }
                     warn!(
                         "MintMaker auto-redeem failed for condition {}: {}",
                         &pair.condition_id[..10], err
                     );
                 }
                 Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Relay error 429") || err_str.contains("rate limit") {
+                        let backoff_secs = Self::parse_relay_backoff_seconds(&err_str);
+                        self.set_relay_backoff(wallet_address, backoff_secs).await;
+                        warn!(
+                            "MintMaker auto-redeem 429 for condition {}: {}",
+                            &pair.condition_id[..10], err_str
+                        );
+                        break;
+                    }
                     warn!(
                         "MintMaker auto-redeem error for condition {}: {}",
                         &pair.condition_id[..10], e

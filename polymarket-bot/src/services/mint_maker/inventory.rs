@@ -55,7 +55,8 @@ pub async fn merge_matched_pair(
         warn!("MintMaker: Merge failed for pair {}: {}", pair_id, err);
         // Revert to Matched so we can retry
         db.update_mint_maker_pair_status(pair_id, "Matched").await?;
-        Ok(None)
+        // Propagate as Err so the caller can detect 429 rate limits
+        Err(anyhow::anyhow!("{}", err))
     }
 }
 

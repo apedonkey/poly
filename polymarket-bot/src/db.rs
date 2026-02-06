@@ -764,6 +764,46 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // ==================== MINT MAKER ANALYTICS ====================
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mint_maker_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                pair_id INTEGER,
+                market_id TEXT NOT NULL,
+                asset TEXT,
+                slug TEXT,
+                expensive_side TEXT NOT NULL,
+                expensive_price REAL NOT NULL,
+                cheap_price REAL NOT NULL,
+                size REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                expensive_filled_at TEXT,
+                cheap_placed_at TEXT,
+                cheap_filled_at TEXT,
+                outcome TEXT DEFAULT 'pending',
+                orphan_side TEXT,
+                market_winner TEXT,
+                pnl REAL,
+                resolved_at TEXT,
+                FOREIGN KEY (wallet_address) REFERENCES wallets(address)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mm_analytics_wallet ON mint_maker_analytics(wallet_address)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mm_analytics_outcome ON mint_maker_analytics(outcome)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mm_analytics_asset ON mint_maker_analytics(asset)")
+            .execute(&self.pool)
+            .await?;
+
         // ==================== MINT MAKER SETTINGS MIGRATIONS ====================
         {
             let mm_info: Vec<(i64, String, String, i64, Option<String>, i64)> = sqlx::query_as(
@@ -857,6 +897,45 @@ impl Database {
             if !mm_info.is_empty() && !has_smart_mode {
                 info!("Migrating mint_maker_settings: adding smart_mode column");
                 sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN smart_mode INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+            let has_pre_place = mm_info.iter().any(|(_, name, _, _, _, _)| name == "pre_place");
+            if !mm_info.is_empty() && !has_pre_place {
+                info!("Migrating mint_maker_settings: adding pre_place column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN pre_place INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_stop_after_profit = mm_info.iter().any(|(_, name, _, _, _, _)| name == "stop_after_profit");
+            if !mm_info.is_empty() && !has_stop_after_profit {
+                info!("Migrating mint_maker_settings: adding stop_after_profit column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN stop_after_profit INTEGER DEFAULT 0")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_relay_backoff = mm_info.iter().any(|(_, name, _, _, _, _)| name == "relay_backoff_until");
+            if !mm_info.is_empty() && !has_relay_backoff {
+                info!("Migrating mint_maker_settings: adding relay_backoff_until column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN relay_backoff_until TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_momentum_threshold = mm_info.iter().any(|(_, name, _, _, _, _)| name == "momentum_threshold");
+            if !mm_info.is_empty() && !has_momentum_threshold {
+                info!("Migrating mint_maker_settings: adding momentum_threshold column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN momentum_threshold REAL DEFAULT 0.10")
+                    .execute(&self.pool)
+                    .await?;
+            }
+
+            let has_depth_check = mm_info.iter().any(|(_, name, _, _, _, _)| name == "depth_check");
+            if !mm_info.is_empty() && !has_depth_check {
+                info!("Migrating mint_maker_settings: adding depth_check column");
+                sqlx::query("ALTER TABLE mint_maker_settings ADD COLUMN depth_check INTEGER DEFAULT 0")
                     .execute(&self.pool)
                     .await?;
             }
@@ -3067,6 +3146,11 @@ impl Database {
                     auto_max_attempts: row.try_get::<i32, _>("auto_max_attempts").unwrap_or(1),
                     balance_reserve: row.try_get::<f64, _>("balance_reserve").unwrap_or(0.0),
                     smart_mode: row.try_get::<i32, _>("smart_mode").unwrap_or(0) != 0,
+                    pre_place: row.try_get::<i32, _>("pre_place").unwrap_or(0) != 0,
+                    stop_after_profit: row.try_get::<i32, _>("stop_after_profit").unwrap_or(0) != 0,
+                    relay_backoff_until: row.try_get::<String, _>("relay_backoff_until").ok(),
+                    momentum_threshold: row.try_get::<f64, _>("momentum_threshold").unwrap_or(0.0),
+                    depth_check: row.try_get::<i32, _>("depth_check").unwrap_or(0) != 0,
                 })
             }
             None => {
@@ -3095,6 +3179,11 @@ impl Database {
                     auto_max_attempts: 1,
                     balance_reserve: 0.0,
                     smart_mode: false,
+                    pre_place: false,
+                    stop_after_profit: false,
+                    relay_backoff_until: None,
+                    momentum_threshold: 0.10,
+                    depth_check: false,
                 })
             }
         }
@@ -3110,8 +3199,9 @@ impl Database {
                 min_spread_profit, max_pairs_per_market, max_total_pairs, stale_order_seconds, assets,
                 min_minutes_to_close, max_minutes_to_close, auto_place, auto_place_size, auto_max_markets,
                 auto_redeem, stop_loss_pct, stop_loss_delay_secs, auto_place_delay_mins, auto_size_pct,
-                auto_max_attempts, balance_reserve, smart_mode, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                auto_max_attempts, balance_reserve, smart_mode, pre_place, stop_after_profit,
+                momentum_threshold, depth_check, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wallet_address) DO UPDATE SET
                 enabled = excluded.enabled,
                 preset = excluded.preset,
@@ -3135,6 +3225,10 @@ impl Database {
                 auto_max_attempts = excluded.auto_max_attempts,
                 balance_reserve = excluded.balance_reserve,
                 smart_mode = excluded.smart_mode,
+                pre_place = excluded.pre_place,
+                stop_after_profit = excluded.stop_after_profit,
+                momentum_threshold = excluded.momentum_threshold,
+                depth_check = excluded.depth_check,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -3161,8 +3255,24 @@ impl Database {
         .bind(settings.auto_max_attempts)
         .bind(settings.balance_reserve)
         .bind(settings.smart_mode as i32)
+        .bind(settings.pre_place as i32)
+        .bind(settings.stop_after_profit as i32)
+        .bind(settings.momentum_threshold)
+        .bind(settings.depth_check as i32)
         .bind(&now)
         .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update relay backoff timestamp (persisted across restarts)
+    pub async fn set_mint_maker_relay_backoff(&self, wallet_address: &str, backoff_until: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE mint_maker_settings SET relay_backoff_until = ? WHERE wallet_address = ?"
+        )
+        .bind(backoff_until)
+        .bind(wallet_address.to_lowercase())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -3187,6 +3297,7 @@ impl Database {
         yes_token_id: Option<&str>,
         no_token_id: Option<&str>,
         neg_risk: bool,
+        status: &str,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query(
@@ -3194,7 +3305,7 @@ impl Database {
             INSERT INTO mint_maker_pairs (wallet_address, market_id, condition_id, question, asset,
                 yes_order_id, no_order_id, yes_bid_price, no_bid_price, size, yes_size, no_size, slug,
                 yes_token_id, no_token_id, neg_risk, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(wallet_address.to_lowercase())
@@ -3213,6 +3324,7 @@ impl Database {
         .bind(yes_token_id)
         .bind(no_token_id)
         .bind(neg_risk as i32)
+        .bind(status)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -3331,6 +3443,56 @@ impl Database {
         Ok(())
     }
 
+    /// After the expensive side fills, set the cheap side order ID and fill price for the expensive side.
+    /// Transitions ExpPlaced → HalfFilled.
+    pub async fn update_mint_maker_pair_cheap_order(
+        &self,
+        pair_id: i64,
+        cheap_order_id: &str,
+        exp_fill_price: &str,
+        is_yes_expensive: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        if is_yes_expensive {
+            // YES was the expensive side (already placed), NO is the cheap side (newly placed)
+            sqlx::query(
+                r#"
+                UPDATE mint_maker_pairs SET
+                    no_order_id = ?,
+                    yes_fill_price = ?,
+                    status = 'HalfFilled',
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(cheap_order_id)
+            .bind(exp_fill_price)
+            .bind(&now)
+            .bind(pair_id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            // NO was the expensive side (already placed), YES is the cheap side (newly placed)
+            sqlx::query(
+                r#"
+                UPDATE mint_maker_pairs SET
+                    yes_order_id = ?,
+                    no_fill_price = ?,
+                    status = 'HalfFilled',
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(cheap_order_id)
+            .bind(exp_fill_price)
+            .bind(&now)
+            .bind(pair_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Update pair merge size (e.g. to cap at actual filled amount)
     pub async fn update_mint_maker_pair_size(&self, pair_id: i64, size: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -3373,7 +3535,7 @@ impl Database {
 
     pub async fn get_mint_maker_open_pairs(&self, wallet_address: &str) -> Result<Vec<MintMakerPairRow>> {
         let rows = sqlx::query(
-            "SELECT * FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled', 'Matched', 'Merging', 'Orphaned', 'StopLoss') ORDER BY created_at DESC"
+            "SELECT * FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled', 'Matched', 'Merging', 'Orphaned', 'StopLoss') ORDER BY created_at DESC"
         )
         .bind(wallet_address.to_lowercase())
         .fetch_all(&self.pool)
@@ -3411,7 +3573,7 @@ impl Database {
     /// Count open pairs for a specific market
     pub async fn count_mint_maker_open_pairs_for_market(&self, wallet_address: &str, market_id: &str) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status IN ('Pending', 'HalfFilled', 'Matched', 'Merging')"
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled', 'Matched', 'Merging')"
         )
         .bind(wallet_address.to_lowercase())
         .bind(market_id)
@@ -3435,7 +3597,7 @@ impl Database {
     /// Count total open pairs for a wallet
     pub async fn count_mint_maker_total_open_pairs(&self, wallet_address: &str) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled', 'Matched', 'Merging')"
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled', 'Matched', 'Merging')"
         )
         .bind(wallet_address.to_lowercase())
         .fetch_one(&self.pool)
@@ -3447,7 +3609,7 @@ impl Database {
     /// Matched/Merging pairs are done with the order book and shouldn't block new placements.
     pub async fn count_mint_maker_unfilled_pairs_for_market(&self, wallet_address: &str, market_id: &str) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status IN ('Pending', 'HalfFilled')"
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled')"
         )
         .bind(wallet_address.to_lowercase())
         .bind(market_id)
@@ -3459,7 +3621,7 @@ impl Database {
     /// Count total pairs with unfilled orders (Pending/HalfFilled only) across all markets.
     pub async fn count_mint_maker_total_unfilled_pairs(&self, wallet_address: &str) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'HalfFilled')"
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled')"
         )
         .bind(wallet_address.to_lowercase())
         .fetch_one(&self.pool)
@@ -3476,6 +3638,35 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    /// Sum USDC already committed to live orders (ExpPlaced/Pending/HalfFilled pairs).
+    /// Uses actual order sizes (yes_size, no_size) for accurate cost calculation.
+    /// This correctly handles inventory-aware pairs where only one side is ordered.
+    pub async fn sum_mint_maker_committed_capital(&self, wallet_address: &str) -> Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(
+                CAST(COALESCE(yes_size, size) AS REAL) * CAST(yes_bid_price AS REAL) +
+                CAST(COALESCE(no_size, size) AS REAL) * CAST(no_bid_price AS REAL)
+            ), 0.0) \
+             FROM mint_maker_pairs WHERE wallet_address = ? AND status IN ('Pending', 'ExpPlaced', 'HalfFilled')"
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Check if a market already has a successfully merged pair (for stop_after_profit mode).
+    pub async fn has_mint_maker_merged_pair_for_market(&self, wallet_address: &str, market_id: &str) -> Result<bool> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mint_maker_pairs WHERE wallet_address = ? AND market_id = ? AND status = 'Merged'"
+        )
+        .bind(wallet_address.to_lowercase())
+        .bind(market_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.0 > 0)
     }
 
     /// Get stale pairs (older than threshold seconds, still pending/half-filled)
@@ -3669,6 +3860,238 @@ impl Database {
             updated_at: row.get("updated_at"),
         }
     }
+
+    // ==================== MINT MAKER ANALYTICS FUNCTIONS ====================
+
+    /// Create an analytics record when a pair is created
+    pub async fn create_mint_maker_analytics(
+        &self,
+        wallet_address: &str,
+        pair_id: i64,
+        market_id: &str,
+        asset: Option<&str>,
+        slug: Option<&str>,
+        expensive_side: &str,
+        expensive_price: f64,
+        cheap_price: f64,
+        size: f64,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO mint_maker_analytics (
+                wallet_address, pair_id, market_id, asset, slug,
+                expensive_side, expensive_price, cheap_price, size, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .bind(pair_id)
+        .bind(market_id)
+        .bind(asset)
+        .bind(slug)
+        .bind(expensive_side)
+        .bind(expensive_price)
+        .bind(cheap_price)
+        .bind(size)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update analytics when expensive side fills
+    pub async fn update_analytics_expensive_filled(&self, pair_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE mint_maker_analytics SET expensive_filled_at = ? WHERE pair_id = ?")
+            .bind(&now)
+            .bind(pair_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update analytics when cheap side is placed
+    pub async fn update_analytics_cheap_placed(&self, pair_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE mint_maker_analytics SET cheap_placed_at = ? WHERE pair_id = ?")
+            .bind(&now)
+            .bind(pair_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update analytics when pair is merged (both sides filled)
+    pub async fn update_analytics_merged(&self, pair_id: i64, pnl: f64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE mint_maker_analytics SET cheap_filled_at = ?, outcome = 'merged', pnl = ?, resolved_at = ? WHERE pair_id = ?"
+        )
+        .bind(&now)
+        .bind(pnl)
+        .bind(&now)
+        .bind(pair_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update analytics when pair becomes an orphan (only one side filled)
+    pub async fn update_analytics_orphaned(&self, pair_id: i64, orphan_side: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE mint_maker_analytics SET outcome = 'orphan_pending', orphan_side = ? WHERE pair_id = ?"
+        )
+        .bind(orphan_side)
+        .bind(pair_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update analytics when orphan market resolves
+    pub async fn update_analytics_orphan_resolved(
+        &self,
+        pair_id: i64,
+        market_winner: &str,
+        pnl: f64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        // Determine win/loss based on orphan_side vs market_winner
+        // orphan_side is YES or NO, market_winner is "Up" or "Down"
+        // YES = Up, NO = Down
+        let outcome = sqlx::query_scalar::<_, String>(
+            "SELECT orphan_side FROM mint_maker_analytics WHERE pair_id = ?"
+        )
+        .bind(pair_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let final_outcome = if let Some(orphan_side) = outcome {
+            let bet_on_up = orphan_side == "YES";
+            let market_went_up = market_winner == "Up";
+            if bet_on_up == market_went_up {
+                "orphan_win"
+            } else {
+                "orphan_loss"
+            }
+        } else {
+            "orphan_unknown"
+        };
+
+        sqlx::query(
+            "UPDATE mint_maker_analytics SET outcome = ?, market_winner = ?, pnl = ?, resolved_at = ? WHERE pair_id = ?"
+        )
+        .bind(final_outcome)
+        .bind(market_winner)
+        .bind(pnl)
+        .bind(&now)
+        .bind(pair_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get analytics summary for a wallet
+    pub async fn get_mint_maker_analytics_summary(&self, wallet_address: &str) -> Result<MintMakerAnalyticsSummary> {
+        let row: (i64, i64, i64, i64, i64, f64, f64, f64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total_pairs,
+                SUM(CASE WHEN outcome = 'merged' THEN 1 ELSE 0 END) as merged,
+                SUM(CASE WHEN outcome = 'orphan_win' THEN 1 ELSE 0 END) as orphan_wins,
+                SUM(CASE WHEN outcome = 'orphan_loss' THEN 1 ELSE 0 END) as orphan_losses,
+                SUM(CASE WHEN outcome = 'orphan_pending' THEN 1 ELSE 0 END) as orphan_pending,
+                COALESCE(SUM(CASE WHEN outcome = 'merged' THEN pnl ELSE 0.0 END), 0.0) as merge_pnl,
+                COALESCE(SUM(CASE WHEN outcome = 'orphan_win' THEN pnl ELSE 0.0 END), 0.0) as orphan_win_pnl,
+                COALESCE(SUM(CASE WHEN outcome = 'orphan_loss' THEN pnl ELSE 0.0 END), 0.0) as orphan_loss_pnl
+            FROM mint_maker_analytics
+            WHERE wallet_address = ?
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0, 0, 0, 0, 0, 0.0, 0.0, 0.0));
+
+        Ok(MintMakerAnalyticsSummary {
+            total_pairs: row.0,
+            merged: row.1,
+            orphan_wins: row.2,
+            orphan_losses: row.3,
+            orphan_pending: row.4,
+            merge_pnl: row.5,
+            orphan_win_pnl: row.6,
+            orphan_loss_pnl: row.7,
+        })
+    }
+
+    /// Get analytics by asset for a wallet
+    pub async fn get_mint_maker_analytics_by_asset(&self, wallet_address: &str) -> Result<Vec<(String, i64, i64, i64, i64)>> {
+        let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(asset, 'unknown') as asset,
+                COUNT(*) as total,
+                SUM(CASE WHEN outcome = 'merged' THEN 1 ELSE 0 END) as merged,
+                SUM(CASE WHEN outcome = 'orphan_win' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome = 'orphan_loss' THEN 1 ELSE 0 END) as losses
+            FROM mint_maker_analytics
+            WHERE wallet_address = ?
+            GROUP BY asset
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Get pending orphans that need resolution checking
+    pub async fn get_pending_orphans(&self, wallet_address: &str) -> Result<Vec<(i64, String, String)>> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            r#"
+            SELECT pair_id, slug, orphan_side
+            FROM mint_maker_analytics
+            WHERE wallet_address = ? AND outcome = 'orphan_pending' AND slug IS NOT NULL
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Get fill time statistics
+    pub async fn get_mint_maker_fill_times(&self, wallet_address: &str) -> Result<(f64, f64)> {
+        // Returns average time from creation to expensive fill, and expensive fill to cheap fill
+        let row: (f64, f64) = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(AVG(
+                    CASE WHEN expensive_filled_at IS NOT NULL
+                    THEN (julianday(expensive_filled_at) - julianday(created_at)) * 86400
+                    ELSE NULL END
+                ), 0.0) as avg_exp_fill_secs,
+                COALESCE(AVG(
+                    CASE WHEN cheap_filled_at IS NOT NULL AND expensive_filled_at IS NOT NULL
+                    THEN (julianday(cheap_filled_at) - julianday(expensive_filled_at)) * 86400
+                    ELSE NULL END
+                ), 0.0) as avg_cheap_fill_secs
+            FROM mint_maker_analytics
+            WHERE wallet_address = ?
+            "#,
+        )
+        .bind(wallet_address.to_lowercase())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0, 0.0));
+
+        Ok(row)
+    }
 }
 
 /// MC tier history row
@@ -3709,6 +4132,14 @@ pub struct MintMakerSettingsRow {
     pub auto_max_attempts: i32,
     pub balance_reserve: f64,
     pub smart_mode: bool,
+    pub pre_place: bool,
+    pub stop_after_profit: bool,
+    /// Relay backoff until (RFC3339 timestamp) - persisted across restarts
+    pub relay_backoff_until: Option<String>,
+    /// Momentum threshold: minimum |price - 0.50| to place (e.g., 0.10 means only enter at 60/40 or more extreme)
+    pub momentum_threshold: f64,
+    /// Whether to check orderbook depth confirms the momentum signal
+    pub depth_check: bool,
 }
 
 /// Mint Maker log entry
@@ -3758,6 +4189,19 @@ pub struct MintMakerPairRow {
     pub stop_loss_order_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Mint Maker analytics summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintMakerAnalyticsSummary {
+    pub total_pairs: i64,
+    pub merged: i64,
+    pub orphan_wins: i64,
+    pub orphan_losses: i64,
+    pub orphan_pending: i64,
+    pub merge_pnl: f64,
+    pub orphan_win_pnl: f64,
+    pub orphan_loss_pnl: f64,
 }
 
 /// MC trade full row (for API responses)

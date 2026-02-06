@@ -87,6 +87,8 @@ pub struct UpdateSettingsRequest {
     pub auto_max_attempts: Option<i32>,
     pub balance_reserve: Option<f64>,
     pub smart_mode: Option<bool>,
+    pub pre_place: Option<bool>,
+    pub stop_after_profit: Option<bool>,
 }
 
 pub async fn update_settings(
@@ -124,6 +126,8 @@ pub async fn update_settings(
     if let Some(v) = req.auto_max_attempts { settings.auto_max_attempts = v; }
     if let Some(v) = req.balance_reserve { settings.balance_reserve = v; }
     if let Some(v) = req.smart_mode { settings.smart_mode = v; }
+    if let Some(v) = req.pre_place { settings.pre_place = v; }
+    if let Some(v) = req.stop_after_profit { settings.stop_after_profit = v; }
     if let Some(p) = &req.preset { settings.preset = p.clone(); }
 
     state.db.upsert_mint_maker_settings(&settings).await
@@ -350,6 +354,71 @@ pub async fn get_stats(
     })))
 }
 
+// ==================== GET /api/mint-maker/analytics ====================
+
+pub async fn get_analytics(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let wallet = validate_session(&state, auth.token()).await?;
+
+    let summary = state.db.get_mint_maker_analytics_summary(&wallet).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("DB error: {}", e) })))?;
+
+    let by_asset = state.db.get_mint_maker_analytics_by_asset(&wallet).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("DB error: {}", e) })))?;
+
+    let (avg_exp_fill_secs, avg_cheap_fill_secs) = state.db.get_mint_maker_fill_times(&wallet).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("DB error: {}", e) })))?;
+
+    // Calculate rates
+    let total_resolved = summary.merged + summary.orphan_wins + summary.orphan_losses;
+    let merge_rate = if total_resolved > 0 {
+        summary.merged as f64 / total_resolved as f64 * 100.0
+    } else { 0.0 };
+
+    let total_orphans = summary.orphan_wins + summary.orphan_losses;
+    let orphan_win_rate = if total_orphans > 0 {
+        summary.orphan_wins as f64 / total_orphans as f64 * 100.0
+    } else { 0.0 };
+
+    let total_pnl = summary.merge_pnl + summary.orphan_win_pnl + summary.orphan_loss_pnl;
+
+    Ok(Json(serde_json::json!({
+        "analytics": {
+            "summary": {
+                "total_pairs": summary.total_pairs,
+                "merged": summary.merged,
+                "orphan_wins": summary.orphan_wins,
+                "orphan_losses": summary.orphan_losses,
+                "orphan_pending": summary.orphan_pending,
+                "merge_rate": format!("{:.1}%", merge_rate),
+                "orphan_win_rate": format!("{:.1}%", orphan_win_rate),
+                "merge_pnl": format!("{:.2}", summary.merge_pnl),
+                "orphan_win_pnl": format!("{:.2}", summary.orphan_win_pnl),
+                "orphan_loss_pnl": format!("{:.2}", summary.orphan_loss_pnl),
+                "total_pnl": format!("{:.2}", total_pnl)
+            },
+            "fill_times": {
+                "avg_expensive_fill_secs": format!("{:.1}", avg_exp_fill_secs),
+                "avg_cheap_fill_secs": format!("{:.1}", avg_cheap_fill_secs)
+            },
+            "by_asset": by_asset.iter().map(|(asset, total, merged, wins, losses)| {
+                let orphan_total = wins + losses;
+                let win_rate = if orphan_total > 0 { *wins as f64 / orphan_total as f64 * 100.0 } else { 0.0 };
+                serde_json::json!({
+                    "asset": asset,
+                    "total": total,
+                    "merged": merged,
+                    "orphan_wins": wins,
+                    "orphan_losses": losses,
+                    "orphan_win_rate": format!("{:.1}%", win_rate)
+                })
+            }).collect::<Vec<_>>()
+        }
+    })))
+}
+
 // ==================== GET /api/mint-maker/log ====================
 
 pub async fn get_log(
@@ -523,7 +592,7 @@ pub async fn place_pair(
             if !cancel_ok {
                 warn!("MintMaker: YES cancel failed — recording orphaned order {}", yes_order_id);
                 let shares_str = yes_shares.to_string();
-                if let Ok(pair_id) = state.db.create_mint_maker_pair(
+                if let Ok(_pair_id) = state.db.create_mint_maker_pair(
                     &wallet, &req.market_id, &req.condition_id, &req.question, &req.asset,
                     &yes_order_id, "",
                     &yes_price.to_string(), "0",
@@ -533,8 +602,8 @@ pub async fn place_pair(
                     Some(&req.yes_token_id),
                     Some(&req.no_token_id),
                     req.neg_risk,
+                    "Orphaned",
                 ).await {
-                    let _ = state.db.update_mint_maker_pair_status(pair_id, "Orphaned").await;
                 }
                 let _ = state.db.log_mint_maker_action(
                     &wallet, "orphaned", Some(&req.market_id), Some(&req.question), Some(&req.asset),
@@ -561,6 +630,7 @@ pub async fn place_pair(
         Some(&req.yes_token_id),
         Some(&req.no_token_id),
         req.neg_risk,
+        "Pending",
     ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("DB error: {}", e) })))?;
 

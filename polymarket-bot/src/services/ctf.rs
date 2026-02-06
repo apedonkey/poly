@@ -15,8 +15,10 @@ use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::Sha256;
+use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -618,6 +620,36 @@ impl CtfService {
             transaction_id: Some(tx_id.to_string()),
             error: Some("Transaction polling timed out after 60s".to_string()),
         })
+    }
+
+    /// Public method to get token balance for a wallet's Safe address
+    /// Returns the balance as a Decimal (scaled from raw 1e6)
+    pub async fn get_token_balance(
+        &self,
+        private_key: &str,
+        token_id: &str,
+    ) -> Result<Decimal> {
+        let ctf: Address = CTF_ADDRESS.parse()?;
+
+        // Derive Safe address from private key
+        let safe_address_str = crate::services::mint_maker::order_manager::derive_safe_address(private_key)
+            .context("Failed to derive safe address")?;
+        let safe_address: Address = safe_address_str
+            .parse()
+            .context("Failed to parse safe address")?;
+
+        // Parse token ID
+        let token_id_u256 = U256::from_str_radix(token_id, 10).unwrap_or(U256::ZERO);
+
+        // Get raw balance
+        let raw_balance = self.check_ctf_balance(ctf, safe_address, token_id_u256).await?;
+
+        // Convert from raw (1e6 scaled) to Decimal
+        let raw_str = raw_balance.to_string();
+        let raw_decimal = Decimal::from_str(&raw_str).unwrap_or(Decimal::ZERO);
+        let scale = Decimal::from(1_000_000);
+
+        Ok(raw_decimal / scale)
     }
 
     /// Check ERC-1155 token balance on the CTF contract via Polygon RPC

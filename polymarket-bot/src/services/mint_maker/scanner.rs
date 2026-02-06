@@ -253,3 +253,158 @@ struct GammaMarket {
     #[serde(default)]
     volume_num: Option<f64>,
 }
+
+// ==================== Orderbook Depth Analysis ====================
+
+#[derive(Debug, Deserialize)]
+struct OrderbookResponse {
+    #[serde(default)]
+    bids: Vec<OrderbookLevel>,
+    #[serde(default)]
+    asks: Vec<OrderbookLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderbookLevel {
+    price: String,
+    size: String,
+}
+
+/// Result of orderbook depth analysis
+#[derive(Debug, Clone)]
+pub struct DepthAnalysis {
+    /// Total USD value of bids
+    pub total_bid_value: Decimal,
+    /// Best bid price
+    pub best_bid: Decimal,
+    /// Number of bid levels
+    pub bid_levels: usize,
+}
+
+/// Fetch orderbook and calculate total bid depth for a token.
+/// Returns the sum of (price * size) for all bids.
+pub async fn fetch_orderbook_depth(
+    client: &reqwest::Client,
+    token_id: &str,
+) -> Option<DepthAnalysis> {
+    let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        debug!("CLOB book HTTP {} for token {}", resp.status(), &token_id[..8.min(token_id.len())]);
+        return None;
+    }
+
+    let book: OrderbookResponse = resp.json().await.ok()?;
+
+    if book.bids.is_empty() {
+        return None;
+    }
+
+    let mut total_value = Decimal::ZERO;
+    let mut best_bid = Decimal::ZERO;
+
+    for (i, level) in book.bids.iter().enumerate() {
+        let price = Decimal::from_str(&level.price).unwrap_or(Decimal::ZERO);
+        let size = Decimal::from_str(&level.size).unwrap_or(Decimal::ZERO);
+        let value = price * size;
+        total_value += value;
+
+        if i == 0 {
+            best_bid = price;
+        }
+    }
+
+    Some(DepthAnalysis {
+        total_bid_value: total_value,
+        best_bid,
+        bid_levels: book.bids.len(),
+    })
+}
+
+/// Check if a market passes the momentum filter.
+/// Returns (passes, reason) tuple.
+pub fn check_momentum_filter(
+    yes_bid: Decimal,
+    no_bid: Decimal,
+    momentum_threshold: Decimal,
+) -> (bool, String) {
+    // Price deviation from 50/50
+    let half = Decimal::from_str("0.50").unwrap();
+    let yes_deviation = (yes_bid - half).abs();
+    let no_deviation = (no_bid - half).abs();
+    let max_deviation = yes_deviation.max(no_deviation);
+
+    if momentum_threshold > Decimal::ZERO && max_deviation < momentum_threshold {
+        return (
+            false,
+            format!(
+                "price deviation {:.2} < threshold {:.2} (yes={:.2}, no={:.2})",
+                max_deviation, momentum_threshold, yes_bid, no_bid
+            ),
+        );
+    }
+
+    (true, "momentum OK".to_string())
+}
+
+/// Check if orderbook depth confirms the momentum signal.
+/// The expensive side should have more bid depth.
+/// Auto-scales the required ratio based on momentum strength:
+///   - Weak momentum (0.55/0.45) → need 2.0x depth
+///   - Strong momentum (0.70/0.30) → need 1.2x depth
+/// Returns (passes, reason) tuple.
+pub fn check_depth_filter_auto(
+    yes_depth: Decimal,
+    no_depth: Decimal,
+    yes_is_expensive: bool,
+    expensive_price: Decimal,
+) -> (bool, String) {
+    if yes_depth == Decimal::ZERO || no_depth == Decimal::ZERO {
+        return (false, "missing depth data".to_string());
+    }
+
+    // Calculate price deviation from 50/50
+    let half = Decimal::from_str("0.50").unwrap();
+    let deviation = (expensive_price - half).abs();
+
+    // Auto-scale required ratio: stronger momentum = less depth confirmation needed
+    // deviation 0.05 → ratio 2.25, deviation 0.10 → ratio 2.0, deviation 0.20 → ratio 1.5, deviation 0.30 → ratio 1.0
+    let base_ratio = Decimal::from_str("2.5").unwrap();
+    let scale = Decimal::from(5);
+    let min_ratio_raw = base_ratio - (deviation * scale);
+    let min_ratio = min_ratio_raw
+        .max(Decimal::from_str("1.2").unwrap())
+        .min(Decimal::from_str("2.0").unwrap());
+
+    let ratio = if yes_is_expensive {
+        yes_depth / no_depth
+    } else {
+        no_depth / yes_depth
+    };
+
+    if ratio < min_ratio {
+        return (
+            false,
+            format!(
+                "depth {:.1}x < required {:.1}x (YES=${:.0}, NO=${:.0}, exp={}@{:.0}¢)",
+                ratio, min_ratio, yes_depth, no_depth,
+                if yes_is_expensive { "YES" } else { "NO" },
+                expensive_price * Decimal::from(100)
+            ),
+        );
+    }
+
+    (
+        true,
+        format!(
+            "depth {:.1}x >= {:.1}x (YES=${:.0}, NO=${:.0})",
+            ratio, min_ratio, yes_depth, no_depth
+        ),
+    )
+}
